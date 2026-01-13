@@ -1,3 +1,6 @@
+import base64
+import ctypes
+from ctypes import wintypes
 import subprocess
 import re
 import tkinter as tk
@@ -69,6 +72,81 @@ OMG_DIVISION_VALUE = "институт синтетической биологи
 # ==========================
 # Вспомогательные функции
 # ==========================
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_byte)),
+    ]
+
+
+def _blob_from_bytes(data: bytes) -> _DataBlob:
+    buffer = ctypes.create_string_buffer(data)
+    blob = _DataBlob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_byte)))
+    blob._buffer = buffer
+    return blob
+
+
+def _bytes_from_blob(blob: _DataBlob) -> bytes:
+    return ctypes.string_at(blob.pbData, blob.cbData)
+
+
+def _crypt_protect(data: bytes) -> bytes:
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    blob_in = _blob_from_bytes(data)
+    blob_out = _DataBlob()
+    if not crypt32.CryptProtectData(
+        ctypes.byref(blob_in),
+        None,
+        None,
+        None,
+        None,
+        0,
+        ctypes.byref(blob_out),
+    ):
+        raise ctypes.WinError()
+    try:
+        return _bytes_from_blob(blob_out)
+    finally:
+        kernel32.LocalFree(blob_out.pbData)
+
+
+def _crypt_unprotect(data: bytes) -> bytes:
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    blob_in = _blob_from_bytes(data)
+    blob_out = _DataBlob()
+    if not crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in),
+        None,
+        None,
+        None,
+        None,
+        0,
+        ctypes.byref(blob_out),
+    ):
+        raise ctypes.WinError()
+    try:
+        return _bytes_from_blob(blob_out)
+    finally:
+        kernel32.LocalFree(blob_out.pbData)
+
+
+def encrypt_password(plain: str) -> str:
+    if not plain:
+        return ""
+    raw = plain.encode("utf-16-le")
+    protected = _crypt_protect(raw)
+    return base64.b64encode(protected).decode("ascii")
+
+
+def decrypt_password(token: str) -> str:
+    if not token:
+        return ""
+    protected = base64.b64decode(token)
+    raw = _crypt_unprotect(protected)
+    return raw.decode("utf-16-le")
 
 def run_powershell(command: str) -> subprocess.CompletedProcess:
     full_cmd = [
@@ -309,6 +387,7 @@ def create_user_in_domain(
     parsed: dict,
     address: str,
     manager_name: str = "",
+    password_plain: str = "",
     dry_run: bool = False,
 ) -> str:
     last_name = parsed.get("last_name") or ""
@@ -347,8 +426,11 @@ def create_user_in_domain(
     mgr_name_value = (manager_name or "").strip()
     mgr_name_escaped = mgr_name_value.replace("'", "''")
 
+    password_escaped = password_plain.replace("'", "''")
+
     ps_lines = [
         "Import-Module ActiveDirectory",
+        f"$securePassword = ConvertTo-SecureString '{password_escaped}' -AsPlainText -Force",
         f"$name = '{display_name}'",
         f"$givenName = '{first_name}'",
         f"$surname = '{last_name}'",
@@ -422,7 +504,7 @@ def create_user_in_domain(
     if is_omg and division:
         new_aduser_cmd += "-Division $division "
 
-    new_aduser_cmd += "-Enabled:$false "
+    new_aduser_cmd += "-AccountPassword $securePassword -Enabled:$false "
 
     other_attrs_parts = []
     if is_omg:
@@ -453,7 +535,8 @@ def create_user_in_domain(
     ps_script = "; ".join(ps_lines)
 
     if dry_run:
-        return f"[{cfg['name']}] DRY RUN PowerShell:\n{ps_script}\n"
+        ps_script_safe = ps_script.replace(password_escaped, "<скрыто>")
+        return f"[{cfg['name']}] DRY RUN PowerShell:\n{ps_script_safe}\n"
 
     proc = run_powershell(ps_script)
     stderr = proc.stderr or ""
@@ -524,6 +607,19 @@ class App(tk.Tk):
         )
         self.cmb_address.pack(side="left", padx=5)
 
+        frm_password = ttk.Frame(frm_middle)
+        frm_password.pack(fill="x", pady=2)
+
+        ttk.Label(frm_password, text="Пароль по умолчанию:").pack(side="left")
+        self.password_var = tk.StringVar()
+        self.password_entry = ttk.Entry(
+            frm_password,
+            textvariable=self.password_var,
+            show="*",
+            width=30,
+        )
+        self.password_entry.pack(side="left", padx=5)
+
         frm_flags = ttk.Frame(frm_middle)
         frm_flags.pack(fill="x", pady=2)
 
@@ -577,6 +673,15 @@ class App(tk.Tk):
         if not raw_text:
             messagebox.showerror("Ошибка", "Текст заявки пуст.")
             return
+
+        password_plain = self.password_var.get().strip()
+        if not password_plain:
+            self.log("Пароль по умолчанию не задан.")
+            messagebox.showerror("Ошибка", "Введите пароль по умолчанию.")
+            return
+
+        password_token = encrypt_password(password_plain)
+        password_plain = decrypt_password(password_token)
 
         parsed = parse_form(raw_text)
 
@@ -681,6 +786,7 @@ class App(tk.Tk):
                     parsed,
                     address,
                     manager_name=manager_name,
+                    password_plain=password_plain,
                     dry_run=dry_run,
                 )
                 self.log(result_log)

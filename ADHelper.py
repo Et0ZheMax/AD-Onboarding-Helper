@@ -40,6 +40,7 @@ CONFIG_PASSWORD_KEY = "password_token"
 ADDRESS_CHOICES = [
     "ул. Щукинская, дом 5, стр.5",
     "ул. Погодинская, д. 10, стр.2",
+    "ул. Погодинская, д. 10, стр.1",
 ]
 
 # Детали адреса для AD (атрибуты: l, postalCode, postOfficeBox, st, c)
@@ -52,6 +53,13 @@ ADDRESS_DETAILS = {
         "country": "RU",          # c
     },
     "ул. Погодинская, д. 10, стр.2": {
+        "pobox": "Москва",
+        "city": "Москва",
+        "state": "Москва",
+        "postal_code": "119121",
+        "country": "RU",
+    },
+        "ул. Погодинская, д. 10, стр.1": {
         "pobox": "Москва",
         "city": "Москва",
         "state": "Москва",
@@ -865,3 +873,4 @@ class App(tk.Tk):
 if __name__ == "__main__":
     app = App()
     app.mainloop()
+

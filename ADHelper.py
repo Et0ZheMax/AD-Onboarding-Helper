@@ -1,6 +1,8 @@
 import base64
 import ctypes
 from ctypes import wintypes
+import json
+import os
 import subprocess
 import re
 import tkinter as tk
@@ -30,6 +32,10 @@ DOMAIN_CONFIGS = [
 ]
 
 COMPANY_NAME = "ФГБУ «ЦСП» ФМБА России"
+
+CONFIG_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "ADHelper")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+CONFIG_PASSWORD_KEY = "password_token"
 
 ADDRESS_CHOICES = [
     "ул. Щукинская, дом 5, стр.5",
@@ -147,6 +153,24 @@ def decrypt_password(token: str) -> str:
     protected = base64.b64decode(token)
     raw = _crypt_unprotect(protected)
     return raw.decode("utf-16-le")
+
+
+def load_password_token() -> str:
+    if not os.path.exists(CONFIG_PATH):
+        return ""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return data.get(CONFIG_PASSWORD_KEY, "") or ""
+
+
+def save_password_token(token: str) -> None:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    data = {CONFIG_PASSWORD_KEY: token}
+    with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
 
 def run_powershell(command: str) -> subprocess.CompletedProcess:
     full_cmd = [
@@ -579,6 +603,7 @@ class App(tk.Tk):
         self.geometry("950x780")
 
         self.domain_vars = {}
+        self.password_token = load_password_token()
         self._build_widgets()
 
     def _build_widgets(self):
@@ -611,14 +636,14 @@ class App(tk.Tk):
         frm_password.pack(fill="x", pady=2)
 
         ttk.Label(frm_password, text="Пароль по умолчанию:").pack(side="left")
-        self.password_var = tk.StringVar()
-        self.password_entry = ttk.Entry(
+        self.password_status_var = tk.StringVar()
+        self._sync_password_status()
+        ttk.Label(frm_password, textvariable=self.password_status_var).pack(side="left", padx=5)
+        ttk.Button(
             frm_password,
-            textvariable=self.password_var,
-            show="*",
-            width=30,
-        )
-        self.password_entry.pack(side="left", padx=5)
+            text="Изменить пароль",
+            command=self._open_password_modal,
+        ).pack(side="left")
 
         frm_flags = ttk.Frame(frm_middle)
         frm_flags.pack(fill="x", pady=2)
@@ -664,6 +689,42 @@ class App(tk.Tk):
         self.txt_log.see("end")
         self.txt_log.configure(state="disabled")
 
+    def _sync_password_status(self):
+        if self.password_token:
+            self.password_status_var.set("пароль задан")
+        else:
+            self.password_status_var.set("пароль не задан")
+
+    def _open_password_modal(self):
+        modal = tk.Toplevel(self)
+        modal.title("Пароль по умолчанию")
+        modal.resizable(False, False)
+        modal.transient(self)
+        modal.grab_set()
+
+        ttk.Label(modal, text="Введите пароль:").pack(anchor="w", padx=10, pady=(10, 4))
+        password_var = tk.StringVar()
+        entry = ttk.Entry(modal, textvariable=password_var, show="*", width=32)
+        entry.pack(padx=10, pady=4)
+        entry.focus_set()
+
+        btn_frame = ttk.Frame(modal)
+        btn_frame.pack(padx=10, pady=(6, 10), fill="x")
+
+        def save_and_close():
+            password_plain = password_var.get().strip()
+            if not password_plain:
+                messagebox.showerror("Ошибка", "Введите пароль.")
+                return
+            token = encrypt_password(password_plain)
+            save_password_token(token)
+            self.password_token = token
+            self._sync_password_status()
+            modal.destroy()
+
+        ttk.Button(btn_frame, text="Сохранить", command=save_and_close).pack(side="left")
+        ttk.Button(btn_frame, text="Отмена", command=modal.destroy).pack(side="left", padx=5)
+
     def on_run(self):
         self.txt_log.configure(state="normal")
         self.txt_log.delete("1.0", "end")
@@ -674,14 +735,17 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка", "Текст заявки пуст.")
             return
 
-        password_plain = self.password_var.get().strip()
-        if not password_plain:
+        if not self.password_token:
             self.log("Пароль по умолчанию не задан.")
             messagebox.showerror("Ошибка", "Введите пароль по умолчанию.")
             return
 
-        password_token = encrypt_password(password_plain)
-        password_plain = decrypt_password(password_token)
+        try:
+            password_plain = decrypt_password(self.password_token)
+        except Exception:
+            self.log("Не удалось расшифровать пароль. Задайте пароль заново.")
+            messagebox.showerror("Ошибка", "Не удалось расшифровать пароль. Задайте пароль заново.")
+            return
 
         parsed = parse_form(raw_text)
 

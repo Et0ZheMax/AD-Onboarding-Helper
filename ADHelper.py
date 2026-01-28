@@ -421,7 +421,7 @@ def create_user_in_domain(
     manager_name: str = "",
     password_plain: str = "",
     dry_run: bool = False,
-) -> str:
+) -> tuple[str, bool]:
     last_name = parsed.get("last_name") or ""
     first_name = parsed.get("first_name") or ""
     middle_name = parsed.get("middle_name") or ""
@@ -568,11 +568,12 @@ def create_user_in_domain(
 
     if dry_run:
         ps_script_safe = ps_script.replace(password_escaped, "<скрыто>")
-        return f"[{cfg['name']}] DRY RUN PowerShell:\n{ps_script_safe}\n"
+        return f"[{cfg['name']}] DRY RUN PowerShell:\n{ps_script_safe}\n", False
 
     proc = run_powershell(ps_script)
     stderr = proc.stderr or ""
     stdout = proc.stdout or ""
+    success = proc.returncode == 0
 
     log_lines = [f"[{cfg['name']}] New-ADUser/Set-ADUser выполнены, код {proc.returncode}"]
 
@@ -597,7 +598,132 @@ def create_user_in_domain(
         log_lines.append("STDERR:")
         log_lines.append(stderr)
 
-    return "\n".join(log_lines) + "\n"
+    return "\n".join(log_lines) + "\n", success
+
+
+def update_user_in_domain(
+    cfg: dict,
+    sam: str,
+    title: str,
+    department: str,
+    office_room: str,
+    mobile_raw: str,
+    address: str,
+    manager_name: str,
+    need_mail: bool,
+) -> tuple[str, bool]:
+    title = (title or "").strip().lower()
+    department = (department or "").strip().lower()
+    office_room = (office_room or "").strip()
+    mobile = normalize_phone(mobile_raw) if mobile_raw else ""
+
+    addr_meta = get_address_details(address)
+    pobox = addr_meta["pobox"]
+    city = addr_meta["city"]
+    state = addr_meta["state"]
+    postal_code = addr_meta["postal_code"]
+    country = addr_meta["country"]
+
+    manager_name = (manager_name or "").strip()
+    manager_escaped = manager_name.replace("'", "''")
+
+    email = sam + cfg["email_suffix"] if need_mail else ""
+
+    is_omg = (cfg["name"] == "omg-cspfmba")
+    otp_mobile = mobile if is_omg and mobile else ""
+
+    ps_lines = [
+        "Import-Module ActiveDirectory",
+        f"$sam = '{sam}'",
+        f"$title = '{title}'",
+        f"$department = '{department}'",
+        f"$office = '{office_room}'",
+        f"$street = '{address}'",
+        f"$mobile = '{mobile}'",
+        f"$mail = '{email}'",
+        f"$mgrName = '{manager_escaped}'",
+        f"$pobox = '{pobox}'",
+        f"$city = '{city}'",
+        f"$state = '{state}'",
+        f"$postalCode = '{postal_code}'",
+        f"$country = '{country}'",
+    ]
+
+    if is_omg:
+        ps_lines.append(f"$otpMobile = '{otp_mobile}'")
+
+    clear_parts = []
+    if not need_mail:
+        clear_parts.append("'EmailAddress'")
+
+    set_cmd = f"Set-ADUser -Server {cfg['server']} -Identity $sam "
+    if title:
+        set_cmd += "-Title $title "
+    if department:
+        set_cmd += "-Department $department "
+    if office_room:
+        set_cmd += "-Office $office "
+    if address:
+        set_cmd += "-StreetAddress $street "
+    if pobox:
+        set_cmd += "-POBox $pobox "
+    if city:
+        set_cmd += "-City $city "
+    if state:
+        set_cmd += "-State $state "
+    if postal_code:
+        set_cmd += "-PostalCode $postalCode "
+    if country:
+        set_cmd += "-Country $country "
+    if need_mail and email:
+        set_cmd += "-EmailAddress $mail "
+    if mobile and not is_omg:
+        set_cmd += "-MobilePhone $mobile "
+    if clear_parts:
+        set_cmd += "-Clear @(" + ", ".join(clear_parts) + ") "
+
+    ps_lines.append(set_cmd)
+
+    replace_parts = []
+    if is_omg and otp_mobile:
+        replace_parts.append("'otpMobile'=$otpMobile")
+
+    if replace_parts:
+        ps_lines.append("Set-ADUser -Server " + cfg["server"] + " -Identity $sam "
+                        "-Replace @{" + "; ".join(replace_parts) + "}")
+
+    post_mgr_cmd = (
+        "if ($mgrName -ne '') { "
+        f"$mgr = Get-ADUser -Server {cfg['server']} "
+        "-Filter \"DisplayName -like '*$mgrName*'\" "
+        "-ErrorAction SilentlyContinue | Select-Object -First 1; "
+        "if ($mgr) { "
+        f"  Set-ADUser -Server {cfg['server']} -Identity $sam -Manager $mgr.DistinguishedName "
+        "} "
+        "}"
+    )
+    ps_lines.append(post_mgr_cmd)
+
+    ps_script = "; ".join(ps_lines)
+    proc = run_powershell(ps_script)
+    stderr = proc.stderr or ""
+    stdout = proc.stdout or ""
+    success = proc.returncode == 0
+
+    log_lines = [f"[{cfg['name']}] Set-ADUser выполнен, код {proc.returncode}"]
+    if "ADIdentityNotFoundException" in stderr and "Set-ADUser" in stderr:
+        log_lines.append(
+            "Пояснение: не удалось обновить руководителя – "
+            "объект руководителя не найден или недоступен в этом домене."
+        )
+    if stdout:
+        log_lines.append("STDOUT:")
+        log_lines.append(stdout)
+    if stderr:
+        log_lines.append("STDERR:")
+        log_lines.append(stderr)
+
+    return "\n".join(log_lines) + "\n", success
 
 
 # ==========================
@@ -608,10 +734,12 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Создание пользователя в AD из заявки")
-        self.geometry("950x780")
+        self.geometry("980x900")
 
         self.domain_vars = {}
         self.password_token = load_password_token()
+        self.history_entries = []
+        self.selected_history_index = None
         self._build_widgets()
 
     def _build_widgets(self):
@@ -691,6 +819,86 @@ class App(tk.Tk):
         self.txt_log = tk.Text(frm_log, height=12, wrap="word", state="disabled")
         self.txt_log.pack(fill="both", expand=True)
 
+        frm_history = ttk.LabelFrame(self, text="История созданных пользователей (текущий запуск)")
+        frm_history.pack(fill="both", expand=False, padx=10, pady=5)
+
+        frm_history_inner = ttk.Frame(frm_history)
+        frm_history_inner.pack(fill="both", expand=True, padx=8, pady=8)
+
+        frm_history_list = ttk.Frame(frm_history_inner)
+        frm_history_list.pack(side="left", fill="both", expand=False)
+
+        self.history_listbox = tk.Listbox(frm_history_list, height=8, width=40)
+        self.history_listbox.pack(side="left", fill="both", expand=False)
+        self.history_listbox.bind("<<ListboxSelect>>", self._on_history_select)
+
+        history_scroll = ttk.Scrollbar(frm_history_list, orient="vertical", command=self.history_listbox.yview)
+        history_scroll.pack(side="right", fill="y")
+        self.history_listbox.configure(yscrollcommand=history_scroll.set)
+
+        frm_history_editor = ttk.Frame(frm_history_inner)
+        frm_history_editor.pack(side="left", fill="both", expand=True, padx=(12, 0))
+
+        ttk.Label(frm_history_editor, text="Редактирование выбранного пользователя:").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6)
+        )
+
+        self.edit_title_var = tk.StringVar()
+        self.edit_department_var = tk.StringVar()
+        self.edit_office_var = tk.StringVar()
+        self.edit_mobile_var = tk.StringVar()
+        self.edit_manager_var = tk.StringVar()
+        self.edit_need_mail_var = tk.BooleanVar()
+        self.edit_address_var = tk.StringVar(value=ADDRESS_CHOICES[0])
+
+        ttk.Label(frm_history_editor, text="Должность:").grid(row=1, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_title_var, width=45).grid(
+            row=1, column=1, sticky="w"
+        )
+
+        ttk.Label(frm_history_editor, text="Отдел (Department):").grid(row=2, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_department_var, width=45).grid(
+            row=2, column=1, sticky="w"
+        )
+
+        ttk.Label(frm_history_editor, text="Кабинет:").grid(row=3, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_office_var, width=45).grid(
+            row=3, column=1, sticky="w"
+        )
+
+        ttk.Label(frm_history_editor, text="Мобильный:").grid(row=4, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_mobile_var, width=45).grid(
+            row=4, column=1, sticky="w"
+        )
+
+        ttk.Label(frm_history_editor, text="Руководитель:").grid(row=5, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_manager_var, width=45).grid(
+            row=5, column=1, sticky="w"
+        )
+
+        ttk.Label(frm_history_editor, text="Адрес офиса:").grid(row=6, column=0, sticky="e", padx=(0, 6))
+        ttk.Combobox(
+            frm_history_editor,
+            textvariable=self.edit_address_var,
+            values=ADDRESS_CHOICES,
+            state="readonly",
+            width=42,
+        ).grid(row=6, column=1, sticky="w")
+
+        ttk.Checkbutton(
+            frm_history_editor,
+            text="Назначить корпоративную почту",
+            variable=self.edit_need_mail_var,
+        ).grid(row=7, column=1, sticky="w", pady=(4, 4))
+
+        self.btn_save_changes = ttk.Button(
+            frm_history_editor,
+            text="Сохранить изменения",
+            command=self._save_history_changes,
+            state="disabled",
+        )
+        self.btn_save_changes.grid(row=8, column=1, sticky="w", pady=(6, 0))
+
     def log(self, msg: str):
         self.txt_log.configure(state="normal")
         self.txt_log.insert("end", msg + "\n")
@@ -732,6 +940,77 @@ class App(tk.Tk):
 
         ttk.Button(btn_frame, text="Сохранить", command=save_and_close).pack(side="left")
         ttk.Button(btn_frame, text="Отмена", command=modal.destroy).pack(side="left", padx=5)
+
+    def _on_history_select(self, _event=None):
+        selection = self.history_listbox.curselection()
+        if not selection:
+            self.selected_history_index = None
+            self.btn_save_changes.configure(state="disabled")
+            return
+        index = selection[0]
+        self.selected_history_index = index
+        entry = self.history_entries[index]
+        self.edit_title_var.set(entry.get("title", ""))
+        self.edit_department_var.set(entry.get("department", ""))
+        self.edit_office_var.set(entry.get("office_room", ""))
+        self.edit_mobile_var.set(entry.get("mobile_phone", ""))
+        self.edit_manager_var.set(entry.get("manager_name", ""))
+        self.edit_need_mail_var.set(bool(entry.get("need_mail")))
+        self.edit_address_var.set(entry.get("address") or ADDRESS_CHOICES[0])
+        self.btn_save_changes.configure(state="normal")
+
+    def _save_history_changes(self):
+        if self.selected_history_index is None:
+            messagebox.showerror("Ошибка", "Выберите пользователя из истории.")
+            return
+        entry = self.history_entries[self.selected_history_index]
+        cfg = entry["cfg"]
+        sam = entry["sam"]
+
+        title = self.edit_title_var.get()
+        department = self.edit_department_var.get()
+        office_room = self.edit_office_var.get()
+        mobile_raw = self.edit_mobile_var.get()
+        manager_name = self.edit_manager_var.get()
+        address = self.edit_address_var.get()
+        need_mail = self.edit_need_mail_var.get()
+
+        confirm = messagebox.askyesno(
+            "Подтверждение",
+            f"Обновить данные пользователя '{entry['display_name']}' "
+            f"в домене '{cfg['name']}'?",
+        )
+        if not confirm:
+            self.log("Обновление отменено пользователем.")
+            return
+
+        result_log, success = update_user_in_domain(
+            cfg,
+            sam,
+            title=title,
+            department=department,
+            office_room=office_room,
+            mobile_raw=mobile_raw,
+            address=address,
+            manager_name=manager_name,
+            need_mail=need_mail,
+        )
+        self.log(result_log)
+        if success:
+            entry.update(
+                {
+                    "title": title,
+                    "department": department,
+                    "office_room": office_room,
+                    "mobile_phone": mobile_raw,
+                    "manager_name": manager_name,
+                    "address": address,
+                    "need_mail": need_mail,
+                }
+            )
+            self.log(f"[{cfg['name']}] Изменения для пользователя '{entry['display_name']}' сохранены.")
+        else:
+            self.log(f"[{cfg['name']}] Не удалось сохранить изменения для пользователя '{entry['display_name']}'.")
 
     def on_run(self):
         self.txt_log.configure(state="normal")
@@ -852,7 +1131,7 @@ class App(tk.Tk):
 
         for cfg in selected_configs:
             try:
-                result_log = create_user_in_domain(
+                result_log, success = create_user_in_domain(
                     cfg,
                     sam,
                     parsed,
@@ -862,6 +1141,23 @@ class App(tk.Tk):
                     dry_run=dry_run,
                 )
                 self.log(result_log)
+                if success and not dry_run:
+                    history_entry = {
+                        "display_name": display_name,
+                        "sam": sam,
+                        "cfg": cfg,
+                        "address": address,
+                        "title": title_norm,
+                        "department": ad_department,
+                        "office_room": parsed.get("office_room") or "",
+                        "mobile_phone": mobile_raw,
+                        "manager_name": manager_name,
+                        "need_mail": parsed.get("need_mail") or False,
+                    }
+                    self.history_entries.append(history_entry)
+                    self.history_listbox.insert(
+                        "end", f"{display_name}\\{cfg['name']}"
+                    )
             except Exception as e:
                 self.log(f"[{cfg['name']}] Ошибка: {e}")
 

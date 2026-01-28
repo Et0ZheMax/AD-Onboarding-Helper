@@ -36,6 +36,7 @@ COMPANY_NAME = "ФГБУ «ЦСП» ФМБА России"
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "ADHelper")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 CONFIG_PASSWORD_KEY = "password_token"
+CONFIG_GEOMETRY_KEY = "window_geometry"
 
 ADDRESS_CHOICES = [
     "ул. Щукинская, дом 5, стр.5",
@@ -163,22 +164,32 @@ def decrypt_password(token: str) -> str:
     return raw.decode("utf-16-le")
 
 
-def load_password_token() -> str:
+def load_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
-        return ""
+        return {}
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, json.JSONDecodeError):
-        return ""
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+def save_config(data: dict) -> None:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+
+def load_password_token() -> str:
+    data = load_config()
     return data.get(CONFIG_PASSWORD_KEY, "") or ""
 
 
 def save_password_token(token: str) -> None:
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    data = {CONFIG_PASSWORD_KEY: token}
-    with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
+    data = load_config()
+    data[CONFIG_PASSWORD_KEY] = token
+    save_config(data)
 
 def run_powershell(command: str) -> subprocess.CompletedProcess:
     full_cmd = [
@@ -399,7 +410,7 @@ def manager_exists_for_domain(cfg: dict, manager_name: str) -> bool:
         "Import-Module ActiveDirectory; "
         f"$name = '{name_ps}'; "
         f"$mgr = Get-ADUser -Server {cfg['server']} "
-        "-Filter \"DisplayName -like '*$name*'\" "
+        "-Filter \"SamAccountName -eq '$name' -or DisplayName -like '*$name*'\" "
         "-ErrorAction SilentlyContinue | Select-Object -First 1; "
         "if ($mgr) { '1' } else { '0' }"
     )
@@ -429,6 +440,33 @@ def user_exists_in_domain_details(cfg: dict, sam: str, upn: str) -> tuple[bool, 
         "} "
     )
 
+    proc = run_powershell(ps)
+    if proc.returncode != 0:
+        return False, ""
+    data = (proc.stdout or "").strip()
+    if not data:
+        return False, ""
+    return True, data
+
+def user_exists_by_display_name(cfg: dict, display_name: str) -> tuple[bool, str]:
+    """
+    Проверяем наличие пользователя в домене по DisplayName.
+    """
+    name = (display_name or "").strip()
+    if not name:
+        return False, ""
+    name_ps = name.replace("'", "''")
+    ps = (
+        "Import-Module ActiveDirectory; "
+        f"$name = '{name_ps}'; "
+        f"$user = Get-ADUser -Server {cfg['server']} "
+        "-Filter \"DisplayName -eq '$name'\" "
+        "-Properties SamAccountName, DisplayName "
+        "-ErrorAction SilentlyContinue | Select-Object -First 1; "
+        "if ($user) { "
+        "  $user.SamAccountName + '|' + $user.DisplayName "
+        "} "
+    )
     proc = run_powershell(ps)
     if proc.returncode != 0:
         return False, ""
@@ -565,6 +603,7 @@ def create_user_in_domain(
         new_aduser_cmd += "-Division $division "
 
     new_aduser_cmd += "-AccountPassword $securePassword -Enabled:$false "
+    new_aduser_cmd += "-ChangePasswordAtLogon $true "
 
     other_attrs_parts = []
     if is_omg:
@@ -582,7 +621,7 @@ def create_user_in_domain(
     post_mgr_cmd = (
         "if ($mgrName -ne '') { "
         f"$mgr = Get-ADUser -Server {cfg['server']} "
-        "-Filter \"DisplayName -like '*$mgrName*'\" "
+        "-Filter \"SamAccountName -eq '$mgrName' -or DisplayName -like '*$mgrName*'\" "
         "-ErrorAction SilentlyContinue | Select-Object -First 1; "
         "if ($mgr) { "
         f"  Set-ADUser -Server {cfg['server']} -Identity $sam -Manager $mgr.DistinguishedName "
@@ -752,7 +791,7 @@ def update_user_in_domain(
     post_mgr_cmd = (
         "if ($mgrName -ne '') { "
         f"$mgr = Get-ADUser -Server {cfg['server']} "
-        "-Filter \"DisplayName -like '*$mgrName*'\" "
+        "-Filter \"SamAccountName -eq '$mgrName' -or DisplayName -like '*$mgrName*'\" "
         "-ErrorAction SilentlyContinue | Select-Object -First 1; "
         "if ($mgr) { "
         f"  Set-ADUser -Server {cfg['server']} -Identity $sam -Manager $mgr.DistinguishedName "
@@ -797,6 +836,8 @@ class App(tk.Tk):
         self.password_token = load_password_token()
         self.history_entries = []
         self.selected_history_index = None
+        self._load_window_geometry()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_widgets()
 
     def _build_widgets(self):
@@ -841,7 +882,7 @@ class App(tk.Tk):
         frm_flags = ttk.Frame(frm_middle)
         frm_flags.pack(fill="x", pady=2)
 
-        self.dry_run_var = tk.BooleanVar(value=True)
+        self.dry_run_var = tk.BooleanVar(value=False)
         chk_dry = ttk.Checkbutton(
             frm_flags,
             text="Только разобрать (без создания пользователей)",
@@ -1009,6 +1050,23 @@ class App(tk.Tk):
         ttk.Button(btn_frame, text="Сохранить", command=save_and_close).pack(side="left")
         ttk.Button(btn_frame, text="Отмена", command=modal.destroy).pack(side="left", padx=5)
 
+    def _load_window_geometry(self):
+        data = load_config()
+        geometry = data.get(CONFIG_GEOMETRY_KEY)
+        if geometry:
+            try:
+                self.geometry(geometry)
+            except tk.TclError:
+                pass
+
+    def _on_close(self):
+        data = load_config()
+        data[CONFIG_GEOMETRY_KEY] = self.geometry()
+        if self.password_token:
+            data[CONFIG_PASSWORD_KEY] = self.password_token
+        save_config(data)
+        self.destroy()
+
     def _on_history_select(self, _event=None):
         selection = self.history_listbox.curselection()
         if not selection:
@@ -1128,8 +1186,37 @@ class App(tk.Tk):
         first_name = parsed.get("first_name", "")
         middle_name = parsed.get("middle_name", "")
 
-        sam = generate_samaccount_name(first_name, last_name)
         display_name = " ".join(x for x in [last_name, first_name, middle_name] if x)
+        existing_sam = None
+        existing_domain_sams = {}
+        for cfg in DOMAIN_CONFIGS:
+            exists, details = user_exists_by_display_name(cfg, display_name)
+            if exists:
+                sam_found, display_found = (details.split("|") + ["", ""])[:2]
+                existing_domain_sams[cfg["name"]] = sam_found
+                if existing_sam and sam_found and existing_sam != sam_found:
+                    self.log(
+                        "Обнаружены разные логины для пользователя с одинаковым ФИО "
+                        f"в доменах: {existing_domain_sams}. "
+                        "Нужно выровнять логины вручную."
+                    )
+                    messagebox.showerror(
+                        "Ошибка",
+                        "В доменах найдены разные логины для одного ФИО. "
+                        "Исправьте логины вручную и повторите попытку.",
+                    )
+                    return
+                if sam_found:
+                    existing_sam = sam_found
+
+        if existing_sam:
+            sam = existing_sam
+            self.log(
+                "Найден существующий пользователь с таким же ФИО. "
+                f"Используем логин '{sam}' во всех доменах."
+            )
+        else:
+            sam = generate_samaccount_name(first_name, last_name)
 
         address = self.address_var.get()
         addr_meta = get_address_details(address)

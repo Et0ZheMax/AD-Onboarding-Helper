@@ -409,6 +409,34 @@ def manager_exists_for_domain(cfg: dict, manager_name: str) -> bool:
         return False
     return (proc.stdout or "").strip() == "1"
 
+def user_exists_in_domain_details(cfg: dict, sam: str, upn: str) -> tuple[bool, str]:
+    """
+    Проверяем наличие пользователя в домене по SamAccountName/UPN.
+    """
+    sam_ps = (sam or "").replace("'", "''")
+    upn_ps = (upn or "").replace("'", "''")
+
+    ps = (
+        "Import-Module ActiveDirectory; "
+        f"$sam = '{sam_ps}'; "
+        f"$upn = '{upn_ps}'; "
+        f"$user = Get-ADUser -Server {cfg['server']} "
+        "-Filter \"SamAccountName -eq '$sam' -or UserPrincipalName -eq '$upn'\" "
+        "-Properties SamAccountName, UserPrincipalName, DisplayName "
+        "-ErrorAction SilentlyContinue | Select-Object -First 1; "
+        "if ($user) { "
+        "  $user.SamAccountName + '|' + $user.UserPrincipalName + '|' + $user.DisplayName "
+        "} "
+    )
+
+    proc = run_powershell(ps)
+    if proc.returncode != 0:
+        return False, ""
+    data = (proc.stdout or "").strip()
+    if not data:
+        return False, ""
+    return True, data
+
 # ==========================
 # Создание пользователя
 # ==========================
@@ -608,6 +636,7 @@ def update_user_in_domain(
     department: str,
     office_room: str,
     mobile_raw: str,
+    telephone_raw: str,
     address: str,
     manager_name: str,
     need_mail: bool,
@@ -616,6 +645,7 @@ def update_user_in_domain(
     department = (department or "").strip().lower()
     office_room = (office_room or "").strip()
     mobile = normalize_phone(mobile_raw) if mobile_raw else ""
+    telephone = normalize_phone(telephone_raw) if telephone_raw else ""
 
     addr_meta = get_address_details(address)
     pobox = addr_meta["pobox"]
@@ -640,6 +670,7 @@ def update_user_in_domain(
         f"$office = '{office_room}'",
         f"$street = '{address}'",
         f"$mobile = '{mobile}'",
+        f"$telephone = '{telephone}'",
         f"$mail = '{email}'",
         f"$mgrName = '{manager_escaped}'",
         f"$pobox = '{pobox}'",
@@ -654,7 +685,31 @@ def update_user_in_domain(
 
     clear_parts = []
     if not need_mail:
-        clear_parts.append("'EmailAddress'")
+        clear_parts.append("'mail'")
+    if not title:
+        clear_parts.append("'title'")
+    if not department:
+        clear_parts.append("'department'")
+    if not office_room:
+        clear_parts.append("'physicalDeliveryOfficeName'")
+    if not address:
+        clear_parts.append("'streetAddress'")
+    if not pobox:
+        clear_parts.append("'postOfficeBox'")
+    if not city:
+        clear_parts.append("'l'")
+    if not state:
+        clear_parts.append("'st'")
+    if not postal_code:
+        clear_parts.append("'postalCode'")
+    if not country:
+        clear_parts.append("'c'")
+    if not mobile:
+        clear_parts.append("'mobile'")
+    if not telephone:
+        clear_parts.append("'telephoneNumber'")
+    if not manager_name:
+        clear_parts.append("'manager'")
 
     set_cmd = f"Set-ADUser -Server {cfg['server']} -Identity $sam "
     if title:
@@ -679,6 +734,8 @@ def update_user_in_domain(
         set_cmd += "-EmailAddress $mail "
     if mobile and not is_omg:
         set_cmd += "-MobilePhone $mobile "
+    if telephone:
+        set_cmd += "-OfficePhone $telephone "
     if clear_parts:
         set_cmd += "-Clear @(" + ", ".join(clear_parts) + ") "
 
@@ -828,7 +885,12 @@ class App(tk.Tk):
         frm_history_list = ttk.Frame(frm_history_inner)
         frm_history_list.pack(side="left", fill="both", expand=False)
 
-        self.history_listbox = tk.Listbox(frm_history_list, height=8, width=40)
+        self.history_listbox = tk.Listbox(
+            frm_history_list,
+            height=8,
+            width=40,
+            exportselection=False,
+        )
         self.history_listbox.pack(side="left", fill="both", expand=False)
         self.history_listbox.bind("<<ListboxSelect>>", self._on_history_select)
 
@@ -847,6 +909,7 @@ class App(tk.Tk):
         self.edit_department_var = tk.StringVar()
         self.edit_office_var = tk.StringVar()
         self.edit_mobile_var = tk.StringVar()
+        self.edit_telephone_var = tk.StringVar()
         self.edit_manager_var = tk.StringVar()
         self.edit_need_mail_var = tk.BooleanVar()
         self.edit_address_var = tk.StringVar(value=ADDRESS_CHOICES[0])
@@ -871,25 +934,30 @@ class App(tk.Tk):
             row=4, column=1, sticky="w"
         )
 
-        ttk.Label(frm_history_editor, text="Руководитель:").grid(row=5, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_manager_var, width=45).grid(
+        ttk.Label(frm_history_editor, text="Стационарный:").grid(row=5, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_telephone_var, width=45).grid(
             row=5, column=1, sticky="w"
         )
 
-        ttk.Label(frm_history_editor, text="Адрес офиса:").grid(row=6, column=0, sticky="e", padx=(0, 6))
+        ttk.Label(frm_history_editor, text="Руководитель:").grid(row=6, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_manager_var, width=45).grid(
+            row=6, column=1, sticky="w"
+        )
+
+        ttk.Label(frm_history_editor, text="Адрес офиса:").grid(row=7, column=0, sticky="e", padx=(0, 6))
         ttk.Combobox(
             frm_history_editor,
             textvariable=self.edit_address_var,
             values=ADDRESS_CHOICES,
             state="readonly",
             width=42,
-        ).grid(row=6, column=1, sticky="w")
+        ).grid(row=7, column=1, sticky="w")
 
         ttk.Checkbutton(
             frm_history_editor,
             text="Назначить корпоративную почту",
             variable=self.edit_need_mail_var,
-        ).grid(row=7, column=1, sticky="w", pady=(4, 4))
+        ).grid(row=8, column=1, sticky="w", pady=(4, 4))
 
         self.btn_save_changes = ttk.Button(
             frm_history_editor,
@@ -897,7 +965,7 @@ class App(tk.Tk):
             command=self._save_history_changes,
             state="disabled",
         )
-        self.btn_save_changes.grid(row=8, column=1, sticky="w", pady=(6, 0))
+        self.btn_save_changes.grid(row=9, column=1, sticky="w", pady=(6, 0))
 
     def log(self, msg: str):
         self.txt_log.configure(state="normal")
@@ -954,6 +1022,7 @@ class App(tk.Tk):
         self.edit_department_var.set(entry.get("department", ""))
         self.edit_office_var.set(entry.get("office_room", ""))
         self.edit_mobile_var.set(entry.get("mobile_phone", ""))
+        self.edit_telephone_var.set(entry.get("telephone_number", ""))
         self.edit_manager_var.set(entry.get("manager_name", ""))
         self.edit_need_mail_var.set(bool(entry.get("need_mail")))
         self.edit_address_var.set(entry.get("address") or ADDRESS_CHOICES[0])
@@ -971,6 +1040,7 @@ class App(tk.Tk):
         department = self.edit_department_var.get()
         office_room = self.edit_office_var.get()
         mobile_raw = self.edit_mobile_var.get()
+        telephone_raw = self.edit_telephone_var.get()
         manager_name = self.edit_manager_var.get()
         address = self.edit_address_var.get()
         need_mail = self.edit_need_mail_var.get()
@@ -991,6 +1061,7 @@ class App(tk.Tk):
             department=department,
             office_room=office_room,
             mobile_raw=mobile_raw,
+            telephone_raw=telephone_raw,
             address=address,
             manager_name=manager_name,
             need_mail=need_mail,
@@ -1003,6 +1074,7 @@ class App(tk.Tk):
                     "department": department,
                     "office_room": office_room,
                     "mobile_phone": mobile_raw,
+                    "telephone_number": telephone_raw,
                     "manager_name": manager_name,
                     "address": address,
                     "need_mail": need_mail,
@@ -1116,8 +1188,26 @@ class App(tk.Tk):
         else:
             self.log("Руководитель в заявке не указан.\n")
 
+        configs_to_create = []
+        for cfg in selected_configs:
+            upn_preview = sam + cfg["upn_suffix"]
+            exists, details = user_exists_in_domain_details(cfg, sam, upn_preview)
+            if exists:
+                sam_found, upn_found, display_found = (details.split("|") + ["", "", ""])[:3]
+                self.log(
+                    f"[{cfg['name']}] Пользователь уже существует в домене: "
+                    f"Sam='{sam_found}', UPN='{upn_found}', DisplayName='{display_found}'. "
+                    "Создание пропущено."
+                )
+            else:
+                configs_to_create.append(cfg)
+
+        if not configs_to_create:
+            self.log("Создание пользователей остановлено: все выбранные домены уже содержат такого пользователя.")
+            return
+
         dry_run = self.dry_run_var.get()
-        dom_list_str = ", ".join(cfg["name"] for cfg in selected_configs)
+        dom_list_str = ", ".join(cfg["name"] for cfg in configs_to_create)
 
         if not dry_run:
             confirm = messagebox.askyesno(
@@ -1129,7 +1219,7 @@ class App(tk.Tk):
                 self.log("Операция отменена пользователем.")
                 return
 
-        for cfg in selected_configs:
+        for cfg in configs_to_create:
             try:
                 result_log, success = create_user_in_domain(
                     cfg,
@@ -1151,6 +1241,7 @@ class App(tk.Tk):
                         "department": ad_department,
                         "office_room": parsed.get("office_room") or "",
                         "mobile_phone": mobile_raw,
+                        "telephone_number": "",
                         "manager_name": manager_name,
                         "need_mail": parsed.get("need_mail") or False,
                     }

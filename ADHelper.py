@@ -409,7 +409,7 @@ def manager_exists_for_domain(cfg: dict, manager_name: str) -> bool:
         return False
     return (proc.stdout or "").strip() == "1"
 
-def user_exists_in_domain(cfg: dict, sam: str, upn: str) -> tuple[bool, str]:
+def user_exists_in_domain_details(cfg: dict, sam: str, upn: str) -> tuple[bool, str]:
     """
     Проверяем наличие пользователя в домене по SamAccountName/UPN.
     """
@@ -1191,7 +1191,7 @@ class App(tk.Tk):
         configs_to_create = []
         for cfg in selected_configs:
             upn_preview = sam + cfg["upn_suffix"]
-            exists, details = user_exists_in_domain(cfg, sam, upn_preview)
+            exists, details = user_exists_in_domain_details(cfg, sam, upn_preview)
             if exists:
                 sam_found, upn_found, display_found = (details.split("|") + ["", "", ""])[:3]
                 self.log(

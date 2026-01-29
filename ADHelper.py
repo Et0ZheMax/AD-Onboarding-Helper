@@ -192,13 +192,20 @@ def save_password_token(token: str) -> None:
     save_config(data)
 
 def run_powershell(command: str) -> subprocess.CompletedProcess:
+    encoding_setup = "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::UTF8; "
     full_cmd = [
         "powershell",
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
-        "-Command", command,
+        "-Command", encoding_setup + command,
     ]
-    return subprocess.run(full_cmd, capture_output=True, text=True, errors="replace")
+    return subprocess.run(
+        full_cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 def escape_ps_string(value: str) -> str:
     return (value or "").replace("'", "''")

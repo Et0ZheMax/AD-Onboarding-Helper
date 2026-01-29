@@ -530,8 +530,9 @@ def search_users_in_domain(cfg: dict, query: str) -> tuple[list, str]:
         "description,division,section",
         "$users | ForEach-Object {",
         "  $mgrName = ''",
-        f"  if ($_.Manager) {{ try {{ $mgrName = (Get-ADUser -Server '{server}' -Identity $_.Manager "
-        "-Properties DisplayName).DisplayName }} catch {{}} }}",
+        f"  if ($_.Manager) {{ $mgr = Get-ADUser -Server '{server}' -Identity $_.Manager "
+        "-Properties DisplayName -ErrorAction SilentlyContinue; "
+        "if ($mgr) { $mgrName = $mgr.DisplayName } }",
         "  [pscustomobject]@{",
         f"    domain = '{domain_name}'",
         "    displayName = $_.DisplayName",

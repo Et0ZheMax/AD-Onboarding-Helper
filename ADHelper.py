@@ -544,14 +544,33 @@ def search_users_in_domain(
     ldap_filter = "(|" + "".join(filter_parts) + ")"
     ldap_filter_ps = escape_ps_string(ldap_filter)
     search_base_arg = f" -SearchBase '{search_base}'" if search_base else ""
+    base_props = [
+        "DisplayName",
+        "SamAccountName",
+        "UserPrincipalName",
+        "telephoneNumber",
+        "mobile",
+        "title",
+        "department",
+        "physicalDeliveryOfficeName",
+        "manager",
+        "mail",
+        "streetAddress",
+        "postOfficeBox",
+        "l",
+        "st",
+        "postalCode",
+        "c",
+        "description",
+    ]
+    extra_props = ["division", "section"] if domain_name == "omg-cspfmba" else []
+    props_arg = ",".join(base_props + extra_props)
     ps_lines = [
         "Import-Module ActiveDirectory",
         f"$ldap = '{ldap_filter_ps}'",
         f"$users = Get-ADUser -Server '{server}' -LDAPFilter $ldap -ResultSetSize 100"
         f"{search_base_arg} "
-        "-Properties DisplayName,SamAccountName,UserPrincipalName,telephoneNumber,mobile,title,department,"
-        "physicalDeliveryOfficeName,manager,mail,streetAddress,postOfficeBox,l,st,postalCode,c,"
-        "description,division,section",
+        f"-Properties {props_arg}",
         "$users | ForEach-Object {",
         "  $mgrName = ''",
         f"  if ($_.Manager) {{ $mgr = Get-ADUser -Server '{server}' -Identity $_.Manager "

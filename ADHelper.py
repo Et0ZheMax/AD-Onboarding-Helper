@@ -556,7 +556,7 @@ def search_users_in_domain(cfg: dict, query: str) -> tuple[list, str]:
         "  }",
         "} | ConvertTo-Json -Depth 4",
     ]
-    proc = run_powershell("; ".join(ps_lines))
+    proc = run_powershell("\n".join(ps_lines))
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
         msg = stderr or "PowerShell вернул ошибку поиска."

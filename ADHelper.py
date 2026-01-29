@@ -7,6 +7,7 @@ import subprocess
 import re
 import tkinter as tk
 from tkinter import ttk, messagebox
+from typing import Optional
 
 # ==========================
 # Конфигурация доменов
@@ -17,6 +18,7 @@ DOMAIN_CONFIGS = [
         "name": "pak-cspmz",
         "label": "Создавать в pak-cspmz",
         "server": "dc03.pak-cspmz.ru",
+        "search_base": "DC=pak-cspmz,DC=ru",
         "ou_dn": "OU=omg,OU=csp,OU=Users,OU=csp,DC=pak-cspmz,DC=ru",
         "upn_suffix": "@pak-cspmz.ru",
         "email_suffix": "@cspfmba.ru",
@@ -25,6 +27,7 @@ DOMAIN_CONFIGS = [
         "name": "omg-cspfmba",
         "label": "Создавать в omg.cspfmba",
         "server": "DC22.omg.cspfmba.ru",
+        "search_base": "DC=omg,DC=cspfmba,DC=ru",
         "ou_dn": "OU=Institute of Synthetic Biology and Genetic Engineering,DC=omg,DC=cspfmba,DC=ru",
         "upn_suffix": "@omg.cspfmba.ru",
         "email_suffix": "@cspfmba.ru",
@@ -279,6 +282,13 @@ def normalize_phone(raw: str) -> str:
         return "8" + digits
     return digits
 
+def diff_field(new_value: str, old_value: str) -> Optional[str]:
+    new_norm = (new_value or "").strip()
+    old_norm = (old_value or "").strip()
+    if new_norm == old_norm:
+        return None
+    return new_value
+
 def parse_form(text: str) -> dict:
     field_map = {
         "Фамилия": "last_name",
@@ -516,6 +526,7 @@ def search_users_in_domain(cfg: dict, query: str) -> tuple[list, str]:
         return [], ""
     q_ldap = escape_ldap_filter(query)
     server = escape_ps_string(cfg["server"])
+    search_base = escape_ps_string(cfg.get("search_base") or "")
     domain_name = cfg["name"]
     q_digits = re.sub(r"\D", "", query)
     q_digits_ldap = escape_ldap_filter(q_digits) if q_digits else ""
@@ -528,10 +539,12 @@ def search_users_in_domain(cfg: dict, query: str) -> tuple[list, str]:
         filter_parts.append(f"(mobile=*{q_digits_ldap}*)")
     ldap_filter = "(|" + "".join(filter_parts) + ")"
     ldap_filter_ps = escape_ps_string(ldap_filter)
+    search_base_arg = f" -SearchBase '{search_base}'" if search_base else ""
     ps_lines = [
         "Import-Module ActiveDirectory",
         f"$ldap = '{ldap_filter_ps}'",
-        f"$users = Get-ADUser -Server '{server}' -LDAPFilter $ldap -ResultSetSize 100 "
+        f"$users = Get-ADUser -Server '{server}' -LDAPFilter $ldap -ResultSetSize 100"
+        f"{search_base_arg} "
         "-Properties DisplayName,SamAccountName,UserPrincipalName,telephoneNumber,mobile,title,department,"
         "physicalDeliveryOfficeName,manager,mail,streetAddress,postOfficeBox,l,st,postalCode,c,"
         "description,division,section",
@@ -781,38 +794,38 @@ def create_user_in_domain(
 def update_user_in_domain(
     cfg: dict,
     sam: str,
-    title: str,
-    department: str,
-    office_room: str,
-    mobile_raw: str,
-    telephone_raw: str,
-    address: str,
-    manager_name: str,
-    need_mail: bool,
-    description: str,
-    division: str,
-    section: str,
+    title: Optional[str],
+    department: Optional[str],
+    office_room: Optional[str],
+    mobile_raw: Optional[str],
+    telephone_raw: Optional[str],
+    address: Optional[str],
+    manager_name: Optional[str],
+    need_mail: Optional[bool],
+    description: Optional[str],
+    division: Optional[str],
+    section: Optional[str],
 ) -> tuple[str, bool]:
-    title = (title or "").strip().lower()
-    department = (department or "").strip().lower()
-    office_room = (office_room or "").strip()
-    mobile = normalize_phone(mobile_raw) if mobile_raw else ""
-    telephone = normalize_phone(telephone_raw) if telephone_raw else ""
-    description = (description or "").strip()
-    division = (division or "").strip()
-    section = (section or "").strip()
-    address = (address or "").strip()
+    title_value = title.strip().lower() if title is not None else None
+    department_value = department.strip().lower() if department is not None else None
+    office_value = office_room.strip() if office_room is not None else None
+    mobile = normalize_phone(mobile_raw) if mobile_raw is not None else None
+    telephone = normalize_phone(telephone_raw) if telephone_raw is not None else None
+    description_value = description.strip() if description is not None else None
+    division_value = division.strip() if division is not None else None
+    section_value = section.strip() if section is not None else None
+    address_value = address.strip() if address is not None else None
 
-    has_address_meta = bool(address and address in ADDRESS_DETAILS)
-    addr_meta = get_address_details(address) if has_address_meta else get_address_details("")
+    has_address_meta = bool(address_value and address_value in ADDRESS_DETAILS)
+    addr_meta = get_address_details(address_value) if has_address_meta else get_address_details("")
     pobox = addr_meta["pobox"]
     city = addr_meta["city"]
     state = addr_meta["state"]
     postal_code = addr_meta["postal_code"]
     country = addr_meta["country"]
 
-    manager_name = (manager_name or "").strip()
-    manager_escaped = manager_name.replace("'", "''")
+    manager_value = manager_name.strip() if manager_name is not None else None
+    manager_escaped = manager_value.replace("'", "''") if manager_value is not None else ""
 
     email = sam + cfg["email_suffix"] if need_mail else ""
 
@@ -822,87 +835,99 @@ def update_user_in_domain(
     ps_lines = [
         "Import-Module ActiveDirectory",
         f"$sam = '{sam}'",
-        f"$title = '{title}'",
-        f"$department = '{department}'",
-        f"$office = '{office_room}'",
-        f"$street = '{address}'",
-        f"$mobile = '{mobile}'",
-        f"$telephone = '{telephone}'",
-        f"$mail = '{email}'",
-        f"$mgrName = '{manager_escaped}'",
-        f"$pobox = '{pobox}'",
-        f"$city = '{city}'",
-        f"$state = '{state}'",
-        f"$postalCode = '{postal_code}'",
-        f"$country = '{country}'",
-        f"$description = '{escape_ps_string(description)}'",
-        f"$division = '{escape_ps_string(division)}'",
-        f"$section = '{escape_ps_string(section)}'",
     ]
 
-    if is_omg:
+    if title_value is not None:
+        ps_lines.append(f"$title = '{title_value}'")
+    if department_value is not None:
+        ps_lines.append(f"$department = '{department_value}'")
+    if office_value is not None:
+        ps_lines.append(f"$office = '{office_value}'")
+    if address_value is not None:
+        ps_lines.append(f"$street = '{address_value}'")
+    if mobile is not None:
+        ps_lines.append(f"$mobile = '{mobile}'")
+    if telephone is not None:
+        ps_lines.append(f"$telephone = '{telephone}'")
+    if need_mail is not None:
+        ps_lines.append(f"$mail = '{email}'")
+    if manager_value is not None:
+        ps_lines.append(f"$mgrName = '{manager_escaped}'")
+    if address_value is not None:
+        ps_lines.append(f"$pobox = '{pobox}'")
+        ps_lines.append(f"$city = '{city}'")
+        ps_lines.append(f"$state = '{state}'")
+        ps_lines.append(f"$postalCode = '{postal_code}'")
+        ps_lines.append(f"$country = '{country}'")
+    if description_value is not None:
+        ps_lines.append(f"$description = '{escape_ps_string(description_value)}'")
+    if division_value is not None:
+        ps_lines.append(f"$division = '{escape_ps_string(division_value)}'")
+    if section_value is not None:
+        ps_lines.append(f"$section = '{escape_ps_string(section_value)}'")
+
+    if is_omg and mobile is not None:
         ps_lines.append(f"$otpMobile = '{otp_mobile}'")
 
     clear_parts = []
-    if not need_mail:
+    if need_mail is False:
         clear_parts.append("'mail'")
-    if not title:
+    if title_value is not None and not title_value:
         clear_parts.append("'title'")
-    if not department:
+    if department_value is not None and not department_value:
         clear_parts.append("'department'")
-    if not office_room:
+    if office_value is not None and not office_value:
         clear_parts.append("'physicalDeliveryOfficeName'")
-    if not address:
+    if address_value is not None and not address_value:
         clear_parts.append("'streetAddress'")
-    if not address:
         clear_parts.append("'postOfficeBox'")
         clear_parts.append("'l'")
         clear_parts.append("'st'")
         clear_parts.append("'postalCode'")
         clear_parts.append("'c'")
-    if not description:
+    if description_value is not None and not description_value:
         clear_parts.append("'description'")
-    if not division:
+    if division_value is not None and not division_value:
         clear_parts.append("'division'")
-    if not section:
+    if section_value is not None and not section_value:
         clear_parts.append("'section'")
-    if has_address_meta and not pobox:
+    if address_value is not None and has_address_meta and not pobox:
         clear_parts.append("'postOfficeBox'")
-    if has_address_meta and not city:
+    if address_value is not None and has_address_meta and not city:
         clear_parts.append("'l'")
-    if has_address_meta and not state:
+    if address_value is not None and has_address_meta and not state:
         clear_parts.append("'st'")
-    if has_address_meta and not postal_code:
+    if address_value is not None and has_address_meta and not postal_code:
         clear_parts.append("'postalCode'")
-    if has_address_meta and not country:
+    if address_value is not None and has_address_meta and not country:
         clear_parts.append("'c'")
-    if not mobile:
+    if mobile is not None and not mobile:
         clear_parts.append("'mobile'")
-    if not telephone:
+    if telephone is not None and not telephone:
         clear_parts.append("'telephoneNumber'")
-    if not manager_name:
+    if manager_value is not None and not manager_value:
         clear_parts.append("'manager'")
 
     set_cmd = f"Set-ADUser -Server {cfg['server']} -Identity $sam "
-    if title:
+    if title_value:
         set_cmd += "-Title $title "
-    if department:
+    if department_value:
         set_cmd += "-Department $department "
-    if office_room:
+    if office_value:
         set_cmd += "-Office $office "
-    if address:
+    if address_value:
         set_cmd += "-StreetAddress $street "
-    if has_address_meta and pobox:
+    if address_value and has_address_meta and pobox:
         set_cmd += "-POBox $pobox "
-    if has_address_meta and city:
+    if address_value and has_address_meta and city:
         set_cmd += "-City $city "
-    if has_address_meta and state:
+    if address_value and has_address_meta and state:
         set_cmd += "-State $state "
-    if has_address_meta and postal_code:
+    if address_value and has_address_meta and postal_code:
         set_cmd += "-PostalCode $postalCode "
-    if has_address_meta and country:
+    if address_value and has_address_meta and country:
         set_cmd += "-Country $country "
-    if description:
+    if description_value:
         set_cmd += "-Description $description "
     if need_mail and email:
         set_cmd += "-EmailAddress $mail "
@@ -913,31 +938,33 @@ def update_user_in_domain(
     if clear_parts:
         set_cmd += "-Clear @(" + ", ".join(clear_parts) + ") "
 
-    ps_lines.append(set_cmd)
+    if set_cmd.strip() != f"Set-ADUser -Server {cfg['server']} -Identity $sam":
+        ps_lines.append(set_cmd)
 
     replace_parts = []
     if is_omg and otp_mobile:
         replace_parts.append("'otpMobile'=$otpMobile")
-    if division:
+    if division_value:
         replace_parts.append("'division'=$division")
-    if section:
+    if section_value:
         replace_parts.append("'section'=$section")
 
     if replace_parts:
         ps_lines.append("Set-ADUser -Server " + cfg["server"] + " -Identity $sam "
                         "-Replace @{" + "; ".join(replace_parts) + "}")
 
-    post_mgr_cmd = (
-        "if ($mgrName -ne '') { "
-        f"$mgr = Get-ADUser -Server {cfg['server']} "
-        "-Filter \"SamAccountName -eq '$mgrName' -or DisplayName -like '*$mgrName*'\" "
-        "-ErrorAction SilentlyContinue | Select-Object -First 1; "
-        "if ($mgr) { "
-        f"  Set-ADUser -Server {cfg['server']} -Identity $sam -Manager $mgr.DistinguishedName "
-        "} "
-        "}"
-    )
-    ps_lines.append(post_mgr_cmd)
+    if manager_value is not None:
+        post_mgr_cmd = (
+            "if ($mgrName -ne '') { "
+            f"$mgr = Get-ADUser -Server {cfg['server']} "
+            "-Filter \"SamAccountName -eq '$mgrName' -or DisplayName -like '*$mgrName*'\" "
+            "-ErrorAction SilentlyContinue | Select-Object -First 1; "
+            "if ($mgr) { "
+            f"  Set-ADUser -Server {cfg['server']} -Identity $sam -Manager $mgr.DistinguishedName "
+            "} "
+            "}"
+        )
+        ps_lines.append(post_mgr_cmd)
 
     ps_script = "; ".join(ps_lines)
     proc = run_powershell(ps_script)
@@ -1098,32 +1125,32 @@ class App(tk.Tk):
         self.edit_address_var = tk.StringVar(value=ADDRESS_CHOICES[0])
 
         ttk.Label(frm_history_editor, text="Должность:").grid(row=1, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_title_var, width=45).grid(
+        ttk.Entry(frm_history_editor, textvariable=self.edit_title_var, width=60).grid(
             row=1, column=1, sticky="w"
         )
 
         ttk.Label(frm_history_editor, text="Отдел (Department):").grid(row=2, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_department_var, width=45).grid(
+        ttk.Entry(frm_history_editor, textvariable=self.edit_department_var, width=60).grid(
             row=2, column=1, sticky="w"
         )
 
         ttk.Label(frm_history_editor, text="Кабинет:").grid(row=3, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_office_var, width=45).grid(
+        ttk.Entry(frm_history_editor, textvariable=self.edit_office_var, width=60).grid(
             row=3, column=1, sticky="w"
         )
 
         ttk.Label(frm_history_editor, text="Мобильный:").grid(row=4, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_mobile_var, width=45).grid(
+        ttk.Entry(frm_history_editor, textvariable=self.edit_mobile_var, width=60).grid(
             row=4, column=1, sticky="w"
         )
 
         ttk.Label(frm_history_editor, text="Стационарный:").grid(row=5, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_telephone_var, width=45).grid(
+        ttk.Entry(frm_history_editor, textvariable=self.edit_telephone_var, width=60).grid(
             row=5, column=1, sticky="w"
         )
 
         ttk.Label(frm_history_editor, text="Руководитель:").grid(row=6, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_manager_var, width=45).grid(
+        ttk.Entry(frm_history_editor, textvariable=self.edit_manager_var, width=60).grid(
             row=6, column=1, sticky="w"
         )
 
@@ -1133,7 +1160,7 @@ class App(tk.Tk):
             textvariable=self.edit_address_var,
             values=ADDRESS_CHOICES,
             state="normal",
-            width=42,
+            width=57,
         ).grid(row=7, column=1, sticky="w")
 
         ttk.Checkbutton(
@@ -1256,31 +1283,31 @@ class App(tk.Tk):
         )
 
         ttk.Label(frm_editor, text="Должность:").grid(row=1, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_title_var, width=45).grid(row=1, column=1, sticky="w")
+        ttk.Entry(frm_editor, textvariable=self.search_title_var, width=60).grid(row=1, column=1, sticky="w")
 
         ttk.Label(frm_editor, text="Отдел (Department):").grid(row=2, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_department_var, width=45).grid(row=2, column=1, sticky="w")
+        ttk.Entry(frm_editor, textvariable=self.search_department_var, width=60).grid(row=2, column=1, sticky="w")
 
         ttk.Label(frm_editor, text="Section:").grid(row=3, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_section_var, width=45).grid(row=3, column=1, sticky="w")
+        ttk.Entry(frm_editor, textvariable=self.search_section_var, width=60).grid(row=3, column=1, sticky="w")
 
         ttk.Label(frm_editor, text="Division:").grid(row=4, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_division_var, width=45).grid(row=4, column=1, sticky="w")
+        ttk.Entry(frm_editor, textvariable=self.search_division_var, width=60).grid(row=4, column=1, sticky="w")
 
         ttk.Label(frm_editor, text="Description:").grid(row=5, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_description_var, width=45).grid(row=5, column=1, sticky="w")
+        ttk.Entry(frm_editor, textvariable=self.search_description_var, width=60).grid(row=5, column=1, sticky="w")
 
         ttk.Label(frm_editor, text="Кабинет:").grid(row=6, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_office_var, width=45).grid(row=6, column=1, sticky="w")
+        ttk.Entry(frm_editor, textvariable=self.search_office_var, width=60).grid(row=6, column=1, sticky="w")
 
         ttk.Label(frm_editor, text="Мобильный:").grid(row=7, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_mobile_var, width=45).grid(row=7, column=1, sticky="w")
+        ttk.Entry(frm_editor, textvariable=self.search_mobile_var, width=60).grid(row=7, column=1, sticky="w")
 
         ttk.Label(frm_editor, text="Стационарный:").grid(row=8, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_telephone_var, width=45).grid(row=8, column=1, sticky="w")
+        ttk.Entry(frm_editor, textvariable=self.search_telephone_var, width=60).grid(row=8, column=1, sticky="w")
 
         ttk.Label(frm_editor, text="Руководитель:").grid(row=9, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_manager_var, width=45).grid(row=9, column=1, sticky="w")
+        ttk.Entry(frm_editor, textvariable=self.search_manager_var, width=60).grid(row=9, column=1, sticky="w")
 
         ttk.Label(frm_editor, text="Адрес офиса:").grid(row=10, column=0, sticky="e", padx=(0, 6))
         ttk.Combobox(
@@ -1288,7 +1315,7 @@ class App(tk.Tk):
             textvariable=self.search_address_var,
             values=ADDRESS_CHOICES,
             state="normal",
-            width=42,
+            width=57,
         ).grid(row=10, column=1, sticky="w")
 
         ttk.Checkbutton(
@@ -1381,17 +1408,41 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка", "Не удалось определить домен или логин пользователя.")
             return
 
-        title = self.search_title_var.get()
-        department = self.search_department_var.get()
-        section = self.search_section_var.get()
-        division = self.search_division_var.get()
-        description = self.search_description_var.get()
-        office_room = self.search_office_var.get()
-        mobile_raw = self.search_mobile_var.get()
-        telephone_raw = self.search_telephone_var.get()
-        manager_name = self.search_manager_var.get()
-        address = self.search_address_var.get()
-        need_mail = self.search_need_mail_var.get()
+        title = diff_field(self.search_title_var.get(), entry.get("title", ""))
+        department = diff_field(self.search_department_var.get(), entry.get("department", ""))
+        section = diff_field(self.search_section_var.get(), entry.get("section", ""))
+        division = diff_field(self.search_division_var.get(), entry.get("division", ""))
+        description = diff_field(self.search_description_var.get(), entry.get("description", ""))
+        office_room = diff_field(self.search_office_var.get(), entry.get("office", ""))
+        mobile_raw = diff_field(self.search_mobile_var.get(), entry.get("mobile", ""))
+        telephone_raw = diff_field(
+            self.search_telephone_var.get(),
+            entry.get("telephoneNumber", ""),
+        )
+        manager_name = diff_field(self.search_manager_var.get(), entry.get("managerName", ""))
+        address = diff_field(self.search_address_var.get(), entry.get("streetAddress", ""))
+        need_mail_current = self.search_need_mail_var.get()
+        need_mail_before = bool(entry.get("mail"))
+        need_mail = need_mail_current if need_mail_current != need_mail_before else None
+
+        if all(
+            value is None
+            for value in (
+                title,
+                department,
+                section,
+                division,
+                description,
+                office_room,
+                mobile_raw,
+                telephone_raw,
+                manager_name,
+                address,
+                need_mail,
+            )
+        ):
+            messagebox.showinfo("Изменения", "Нет изменений для сохранения.")
+            return
 
         confirm = messagebox.askyesno(
             "Подтверждение",
@@ -1419,21 +1470,31 @@ class App(tk.Tk):
         )
         self.log(result_log)
         if success:
-            entry.update(
-                {
-                    "title": title,
-                    "department": department,
-                    "section": section,
-                    "division": division,
-                    "description": description,
-                    "office": office_room,
-                    "mobile": mobile_raw,
-                    "telephoneNumber": telephone_raw,
-                    "managerName": manager_name,
-                    "streetAddress": address,
-                    "mail": sam + cfg["email_suffix"] if need_mail else "",
-                }
-            )
+            updates = {}
+            if title is not None:
+                updates["title"] = title
+            if department is not None:
+                updates["department"] = department
+            if section is not None:
+                updates["section"] = section
+            if division is not None:
+                updates["division"] = division
+            if description is not None:
+                updates["description"] = description
+            if office_room is not None:
+                updates["office"] = office_room
+            if mobile_raw is not None:
+                updates["mobile"] = mobile_raw
+            if telephone_raw is not None:
+                updates["telephoneNumber"] = telephone_raw
+            if manager_name is not None:
+                updates["managerName"] = manager_name
+            if address is not None:
+                updates["streetAddress"] = address
+            if need_mail is not None:
+                updates["mail"] = sam + cfg["email_suffix"] if need_mail else ""
+            if updates:
+                entry.update(updates)
             self.log(f"[{cfg['name']}] Изменения для пользователя '{entry.get('displayName')}' сохранены.")
         else:
             self.log(f"[{cfg['name']}] Не удалось сохранить изменения для пользователя '{entry.get('displayName')}'.")
@@ -1482,14 +1543,35 @@ class App(tk.Tk):
         cfg = entry["cfg"]
         sam = entry["sam"]
 
-        title = self.edit_title_var.get()
-        department = self.edit_department_var.get()
-        office_room = self.edit_office_var.get()
-        mobile_raw = self.edit_mobile_var.get()
-        telephone_raw = self.edit_telephone_var.get()
-        manager_name = self.edit_manager_var.get()
-        address = self.edit_address_var.get()
-        need_mail = self.edit_need_mail_var.get()
+        title = diff_field(self.edit_title_var.get(), entry.get("title", ""))
+        department = diff_field(self.edit_department_var.get(), entry.get("department", ""))
+        office_room = diff_field(self.edit_office_var.get(), entry.get("office_room", ""))
+        mobile_raw = diff_field(self.edit_mobile_var.get(), entry.get("mobile_phone", ""))
+        telephone_raw = diff_field(
+            self.edit_telephone_var.get(),
+            entry.get("telephone_number", ""),
+        )
+        manager_name = diff_field(self.edit_manager_var.get(), entry.get("manager_name", ""))
+        address = diff_field(self.edit_address_var.get(), entry.get("address", ""))
+        need_mail_current = self.edit_need_mail_var.get()
+        need_mail_before = bool(entry.get("need_mail"))
+        need_mail = need_mail_current if need_mail_current != need_mail_before else None
+
+        if all(
+            value is None
+            for value in (
+                title,
+                department,
+                office_room,
+                mobile_raw,
+                telephone_raw,
+                manager_name,
+                address,
+                need_mail,
+            )
+        ):
+            messagebox.showinfo("Изменения", "Нет изменений для сохранения.")
+            return
 
         confirm = messagebox.askyesno(
             "Подтверждение",
@@ -1511,24 +1593,31 @@ class App(tk.Tk):
             address=address,
             manager_name=manager_name,
             need_mail=need_mail,
-            description=entry.get("description", ""),
-            division=entry.get("division", ""),
-            section=entry.get("section", ""),
+            description=None,
+            division=None,
+            section=None,
         )
         self.log(result_log)
         if success:
-            entry.update(
-                {
-                    "title": title,
-                    "department": department,
-                    "office_room": office_room,
-                    "mobile_phone": mobile_raw,
-                    "telephone_number": telephone_raw,
-                    "manager_name": manager_name,
-                    "address": address,
-                    "need_mail": need_mail,
-                }
-            )
+            updates = {}
+            if title is not None:
+                updates["title"] = title
+            if department is not None:
+                updates["department"] = department
+            if office_room is not None:
+                updates["office_room"] = office_room
+            if mobile_raw is not None:
+                updates["mobile_phone"] = mobile_raw
+            if telephone_raw is not None:
+                updates["telephone_number"] = telephone_raw
+            if manager_name is not None:
+                updates["manager_name"] = manager_name
+            if address is not None:
+                updates["address"] = address
+            if need_mail is not None:
+                updates["need_mail"] = need_mail
+            if updates:
+                entry.update(updates)
             self.log(f"[{cfg['name']}] Изменения для пользователя '{entry['display_name']}' сохранены.")
         else:
             self.log(f"[{cfg['name']}] Не удалось сохранить изменения для пользователя '{entry['display_name']}'.")

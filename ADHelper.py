@@ -532,7 +532,7 @@ def search_users_in_domain(cfg: dict, query: str) -> tuple[list, str]:
         "Import-Module ActiveDirectory",
         f"$ldap = '{ldap_filter_ps}'",
         f"$users = Get-ADUser -Server '{server}' -LDAPFilter $ldap -ResultSetSize 100 "
-        "-Properties DisplayName,SamAccountName,telephoneNumber,mobile,title,department,"
+        "-Properties DisplayName,SamAccountName,UserPrincipalName,telephoneNumber,mobile,title,department,"
         "physicalDeliveryOfficeName,manager,mail,streetAddress,postOfficeBox,l,st,postalCode,c,"
         "description,division,section",
         "$users | ForEach-Object {",
@@ -540,10 +540,12 @@ def search_users_in_domain(cfg: dict, query: str) -> tuple[list, str]:
         f"  if ($_.Manager) {{ $mgr = Get-ADUser -Server '{server}' -Identity $_.Manager "
         "-Properties DisplayName -ErrorAction SilentlyContinue; "
         "if ($mgr) { $mgrName = $mgr.DisplayName } }",
+        "  $display = if ($_.DisplayName) { $_.DisplayName } else { $_.Name }",
         "  [pscustomobject]@{",
         f"    domain = '{domain_name}'",
-        "    displayName = $_.DisplayName",
+        "    displayName = $display",
         "    sam = $_.SamAccountName",
+        "    upn = $_.UserPrincipalName",
         "    telephoneNumber = $_.telephoneNumber",
         "    mobile = $_.mobile",
         "    title = $_.title",
@@ -1320,7 +1322,12 @@ class App(tk.Tk):
         )
         self.search_listbox.delete(0, "end")
         for item in self.search_results:
-            display_name = item.get("displayName") or "(без имени)"
+            display_name = (
+                item.get("displayName")
+                or item.get("sam")
+                or item.get("upn")
+                or "(без имени)"
+            )
             domain = item.get("domain") or "unknown"
             self.search_listbox.insert("end", f"{display_name} — {domain}")
         self.search_result_count_var.set(f"Найдено: {len(self.search_results)}")
@@ -1352,7 +1359,12 @@ class App(tk.Tk):
         self.search_manager_var.set(entry.get("managerName", "") or "")
         self.search_address_var.set(entry.get("streetAddress", "") or "")
         self.search_need_mail_var.set(bool(entry.get("mail")))
-        display_name = entry.get("displayName") or "(без имени)"
+        display_name = (
+            entry.get("displayName")
+            or entry.get("sam")
+            or entry.get("upn")
+            or "(без имени)"
+        )
         domain = entry.get("domain") or "unknown"
         self.search_selected_label_var.set(f"Редактирование: {display_name} ({domain})")
         self.btn_save_search.configure(state="normal")

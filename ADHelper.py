@@ -200,6 +200,23 @@ def run_powershell(command: str) -> subprocess.CompletedProcess:
     ]
     return subprocess.run(full_cmd, capture_output=True, text=True, errors="replace")
 
+def escape_ps_string(value: str) -> str:
+    return (value or "").replace("'", "''")
+
+def parse_ps_json(raw: str) -> list:
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    return []
+
 def translit_gost(text: str) -> str:
     mapping = {
         "а": "a",  "б": "b",  "в": "v",   "г": "g",   "д": "d",
@@ -475,6 +492,61 @@ def user_exists_by_display_name(cfg: dict, display_name: str) -> tuple[bool, str
         return False, ""
     return True, data
 
+def search_users_in_domain(cfg: dict, query: str) -> list:
+    query = (query or "").strip()
+    if not query:
+        return []
+    q_ps = escape_ps_string(query)
+    server = cfg["server"]
+    domain_name = cfg["name"]
+    ps_lines = [
+        "Import-Module ActiveDirectory",
+        f"$q = '{q_ps}'",
+        "$qDigits = ($q -replace '\\\\D', '')",
+        "$filter = \"DisplayName -like '*$q*' -or SamAccountName -like '*$q*'\"",
+        "if ($qDigits) { $filter += \" -or telephoneNumber -like '*$qDigits*' -or mobile -like '*$qDigits*'\" }",
+        f"$users = Get-ADUser -Server {server} -Filter $filter -ResultSetSize 100 "
+        "-Properties DisplayName,SamAccountName,telephoneNumber,mobile,title,department,"
+        "physicalDeliveryOfficeName,manager,mail,streetAddress,postOfficeBox,l,st,postalCode,c,"
+        "description,division,section",
+        "$users | ForEach-Object {",
+        "  $mgrName = ''",
+        f"  if ($_.Manager) {{ try {{ $mgrName = (Get-ADUser -Server {server} -Identity $_.Manager "
+        "-Properties DisplayName).DisplayName }} catch {{}} }}",
+        "  [pscustomobject]@{",
+        f"    domain = '{domain_name}'",
+        "    displayName = $_.DisplayName",
+        "    sam = $_.SamAccountName",
+        "    telephoneNumber = $_.telephoneNumber",
+        "    mobile = $_.mobile",
+        "    title = $_.title",
+        "    department = $_.department",
+        "    office = $_.physicalDeliveryOfficeName",
+        "    managerName = $mgrName",
+        "    mail = $_.mail",
+        "    streetAddress = $_.streetAddress",
+        "    postOfficeBox = $_.postOfficeBox",
+        "    city = $_.l",
+        "    state = $_.st",
+        "    postalCode = $_.postalCode",
+        "    country = $_.c",
+        "    description = $_.description",
+        "    division = $_.division",
+        "    section = $_.section",
+        "  }",
+        "} | ConvertTo-Json -Depth 4",
+    ]
+    proc = run_powershell("; ".join(ps_lines))
+    if proc.returncode != 0:
+        return []
+    return parse_ps_json(proc.stdout)
+
+def search_users_in_all_domains(query: str) -> list:
+    results = []
+    for cfg in DOMAIN_CONFIGS:
+        results.extend(search_users_in_domain(cfg, query))
+    return results
+
 # ==========================
 # Создание пользователя
 # ==========================
@@ -679,14 +751,22 @@ def update_user_in_domain(
     address: str,
     manager_name: str,
     need_mail: bool,
+    description: str,
+    division: str,
+    section: str,
 ) -> tuple[str, bool]:
     title = (title or "").strip().lower()
     department = (department or "").strip().lower()
     office_room = (office_room or "").strip()
     mobile = normalize_phone(mobile_raw) if mobile_raw else ""
     telephone = normalize_phone(telephone_raw) if telephone_raw else ""
+    description = (description or "").strip()
+    division = (division or "").strip()
+    section = (section or "").strip()
+    address = (address or "").strip()
 
-    addr_meta = get_address_details(address)
+    has_address_meta = bool(address and address in ADDRESS_DETAILS)
+    addr_meta = get_address_details(address) if has_address_meta else get_address_details("")
     pobox = addr_meta["pobox"]
     city = addr_meta["city"]
     state = addr_meta["state"]
@@ -717,6 +797,9 @@ def update_user_in_domain(
         f"$state = '{state}'",
         f"$postalCode = '{postal_code}'",
         f"$country = '{country}'",
+        f"$description = '{escape_ps_string(description)}'",
+        f"$division = '{escape_ps_string(division)}'",
+        f"$section = '{escape_ps_string(section)}'",
     ]
 
     if is_omg:
@@ -733,15 +816,27 @@ def update_user_in_domain(
         clear_parts.append("'physicalDeliveryOfficeName'")
     if not address:
         clear_parts.append("'streetAddress'")
-    if not pobox:
+    if not address:
         clear_parts.append("'postOfficeBox'")
-    if not city:
         clear_parts.append("'l'")
-    if not state:
         clear_parts.append("'st'")
-    if not postal_code:
         clear_parts.append("'postalCode'")
-    if not country:
+        clear_parts.append("'c'")
+    if not description:
+        clear_parts.append("'description'")
+    if not division:
+        clear_parts.append("'division'")
+    if not section:
+        clear_parts.append("'section'")
+    if has_address_meta and not pobox:
+        clear_parts.append("'postOfficeBox'")
+    if has_address_meta and not city:
+        clear_parts.append("'l'")
+    if has_address_meta and not state:
+        clear_parts.append("'st'")
+    if has_address_meta and not postal_code:
+        clear_parts.append("'postalCode'")
+    if has_address_meta and not country:
         clear_parts.append("'c'")
     if not mobile:
         clear_parts.append("'mobile'")
@@ -759,16 +854,18 @@ def update_user_in_domain(
         set_cmd += "-Office $office "
     if address:
         set_cmd += "-StreetAddress $street "
-    if pobox:
+    if has_address_meta and pobox:
         set_cmd += "-POBox $pobox "
-    if city:
+    if has_address_meta and city:
         set_cmd += "-City $city "
-    if state:
+    if has_address_meta and state:
         set_cmd += "-State $state "
-    if postal_code:
+    if has_address_meta and postal_code:
         set_cmd += "-PostalCode $postalCode "
-    if country:
+    if has_address_meta and country:
         set_cmd += "-Country $country "
+    if description:
+        set_cmd += "-Description $description "
     if need_mail and email:
         set_cmd += "-EmailAddress $mail "
     if mobile and not is_omg:
@@ -783,6 +880,10 @@ def update_user_in_domain(
     replace_parts = []
     if is_omg and otp_mobile:
         replace_parts.append("'otpMobile'=$otpMobile")
+    if division:
+        replace_parts.append("'division'=$division")
+    if section:
+        replace_parts.append("'section'=$section")
 
     if replace_parts:
         ps_lines.append("Set-ADUser -Server " + cfg["server"] + " -Identity $sam "
@@ -908,6 +1009,9 @@ class App(tk.Tk):
 
         btn_run = ttk.Button(frm_btn, text="Разобрать и создать", command=self.on_run)
         btn_run.pack(side="left")
+        ttk.Button(frm_btn, text="Поиск пользователей", command=self._open_search_modal).pack(
+            side="left", padx=6
+        )
 
         frm_log = ttk.Frame(self)
         frm_log.pack(fill="both", expand=True, padx=10, pady=5)
@@ -990,7 +1094,7 @@ class App(tk.Tk):
             frm_history_editor,
             textvariable=self.edit_address_var,
             values=ADDRESS_CHOICES,
-            state="readonly",
+            state="normal",
             width=42,
         ).grid(row=7, column=1, sticky="w")
 
@@ -1049,6 +1153,240 @@ class App(tk.Tk):
 
         ttk.Button(btn_frame, text="Сохранить", command=save_and_close).pack(side="left")
         ttk.Button(btn_frame, text="Отмена", command=modal.destroy).pack(side="left", padx=5)
+
+    def _open_search_modal(self):
+        modal = tk.Toplevel(self)
+        modal.title("Поиск пользователей в AD")
+        modal.geometry("980x600")
+        modal.transient(self)
+        modal.grab_set()
+
+        self.search_results = []
+        self.selected_search_index = None
+
+        self.search_query_var = tk.StringVar()
+        self.search_result_count_var = tk.StringVar(value="Найдено: 0")
+        self.search_selected_label_var = tk.StringVar(value="Пользователь не выбран")
+
+        self.search_title_var = tk.StringVar()
+        self.search_department_var = tk.StringVar()
+        self.search_section_var = tk.StringVar()
+        self.search_division_var = tk.StringVar()
+        self.search_description_var = tk.StringVar()
+        self.search_office_var = tk.StringVar()
+        self.search_mobile_var = tk.StringVar()
+        self.search_telephone_var = tk.StringVar()
+        self.search_manager_var = tk.StringVar()
+        self.search_address_var = tk.StringVar()
+        self.search_need_mail_var = tk.BooleanVar()
+
+        frm_top = ttk.Frame(modal)
+        frm_top.pack(fill="x", padx=10, pady=8)
+
+        ttk.Label(frm_top, text="Поиск (ФИО, телефон, логин):").pack(side="left")
+        entry = ttk.Entry(frm_top, textvariable=self.search_query_var, width=40)
+        entry.pack(side="left", padx=6)
+        entry.bind("<Return>", lambda _event: self._run_search(modal))
+        ttk.Button(frm_top, text="Найти", command=lambda: self._run_search(modal)).pack(side="left")
+        ttk.Label(frm_top, textvariable=self.search_result_count_var).pack(side="left", padx=10)
+
+        frm_body = ttk.Frame(modal)
+        frm_body.pack(fill="both", expand=True, padx=10, pady=8)
+
+        frm_list = ttk.Frame(frm_body)
+        frm_list.pack(side="left", fill="both", expand=False)
+
+        self.search_listbox = tk.Listbox(
+            frm_list,
+            height=16,
+            width=45,
+            exportselection=False,
+        )
+        self.search_listbox.pack(side="left", fill="both", expand=False)
+        self.search_listbox.bind("<<ListboxSelect>>", self._on_search_select)
+        self.search_listbox.bind("<Double-Button-1>", self._on_search_select)
+
+        search_scroll = ttk.Scrollbar(frm_list, orient="vertical", command=self.search_listbox.yview)
+        search_scroll.pack(side="right", fill="y")
+        self.search_listbox.configure(yscrollcommand=search_scroll.set)
+
+        frm_editor = ttk.Frame(frm_body)
+        frm_editor.pack(side="left", fill="both", expand=True, padx=(12, 0))
+
+        ttk.Label(frm_editor, textvariable=self.search_selected_label_var).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6)
+        )
+
+        ttk.Label(frm_editor, text="Должность:").grid(row=1, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_title_var, width=45).grid(row=1, column=1, sticky="w")
+
+        ttk.Label(frm_editor, text="Отдел (Department):").grid(row=2, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_department_var, width=45).grid(row=2, column=1, sticky="w")
+
+        ttk.Label(frm_editor, text="Section:").grid(row=3, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_section_var, width=45).grid(row=3, column=1, sticky="w")
+
+        ttk.Label(frm_editor, text="Division:").grid(row=4, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_division_var, width=45).grid(row=4, column=1, sticky="w")
+
+        ttk.Label(frm_editor, text="Description:").grid(row=5, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_description_var, width=45).grid(row=5, column=1, sticky="w")
+
+        ttk.Label(frm_editor, text="Кабинет:").grid(row=6, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_office_var, width=45).grid(row=6, column=1, sticky="w")
+
+        ttk.Label(frm_editor, text="Мобильный:").grid(row=7, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_mobile_var, width=45).grid(row=7, column=1, sticky="w")
+
+        ttk.Label(frm_editor, text="Стационарный:").grid(row=8, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_telephone_var, width=45).grid(row=8, column=1, sticky="w")
+
+        ttk.Label(frm_editor, text="Руководитель:").grid(row=9, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_manager_var, width=45).grid(row=9, column=1, sticky="w")
+
+        ttk.Label(frm_editor, text="Адрес офиса:").grid(row=10, column=0, sticky="e", padx=(0, 6))
+        ttk.Combobox(
+            frm_editor,
+            textvariable=self.search_address_var,
+            values=ADDRESS_CHOICES,
+            state="normal",
+            width=42,
+        ).grid(row=10, column=1, sticky="w")
+
+        ttk.Checkbutton(
+            frm_editor,
+            text="Назначить корпоративную почту",
+            variable=self.search_need_mail_var,
+        ).grid(row=11, column=1, sticky="w", pady=(4, 4))
+
+        self.btn_save_search = ttk.Button(
+            frm_editor,
+            text="Сохранить изменения",
+            command=self._save_search_changes,
+            state="disabled",
+        )
+        self.btn_save_search.grid(row=12, column=1, sticky="w", pady=(6, 0))
+
+        entry.focus_set()
+
+    def _run_search(self, modal):
+        query = self.search_query_var.get().strip()
+        if not query:
+            messagebox.showerror("Ошибка", "Введите строку для поиска.")
+            return
+        modal.configure(cursor="watch")
+        modal.update_idletasks()
+        results = search_users_in_all_domains(query)
+        modal.configure(cursor="")
+        self.search_results = sorted(
+            results,
+            key=lambda item: ((item.get("displayName") or "").lower(), item.get("domain") or ""),
+        )
+        self.search_listbox.delete(0, "end")
+        for item in self.search_results:
+            display_name = item.get("displayName") or "(без имени)"
+            domain = item.get("domain") or "unknown"
+            self.search_listbox.insert("end", f"{display_name} — {domain}")
+        self.search_result_count_var.set(f"Найдено: {len(self.search_results)}")
+        self.selected_search_index = None
+        self.search_selected_label_var.set("Пользователь не выбран")
+        self.btn_save_search.configure(state="disabled")
+        if not self.search_results:
+            messagebox.showinfo("Результаты", "Пользователи не найдены.")
+
+    def _on_search_select(self, _event=None):
+        selection = self.search_listbox.curselection()
+        if not selection:
+            self.selected_search_index = None
+            self.btn_save_search.configure(state="disabled")
+            return
+        index = selection[0]
+        self.selected_search_index = index
+        entry = self.search_results[index]
+        self.search_title_var.set(entry.get("title", "") or "")
+        self.search_department_var.set(entry.get("department", "") or "")
+        self.search_section_var.set(entry.get("section", "") or "")
+        self.search_division_var.set(entry.get("division", "") or "")
+        self.search_description_var.set(entry.get("description", "") or "")
+        self.search_office_var.set(entry.get("office", "") or "")
+        self.search_mobile_var.set(entry.get("mobile", "") or "")
+        self.search_telephone_var.set(entry.get("telephoneNumber", "") or "")
+        self.search_manager_var.set(entry.get("managerName", "") or "")
+        self.search_address_var.set(entry.get("streetAddress", "") or "")
+        self.search_need_mail_var.set(bool(entry.get("mail")))
+        display_name = entry.get("displayName") or "(без имени)"
+        domain = entry.get("domain") or "unknown"
+        self.search_selected_label_var.set(f"Редактирование: {display_name} ({domain})")
+        self.btn_save_search.configure(state="normal")
+
+    def _save_search_changes(self):
+        if self.selected_search_index is None:
+            messagebox.showerror("Ошибка", "Выберите пользователя из результатов поиска.")
+            return
+        entry = self.search_results[self.selected_search_index]
+        sam = entry.get("sam")
+        domain_name = entry.get("domain")
+        cfg = next((c for c in DOMAIN_CONFIGS if c["name"] == domain_name), None)
+        if not cfg or not sam:
+            messagebox.showerror("Ошибка", "Не удалось определить домен или логин пользователя.")
+            return
+
+        title = self.search_title_var.get()
+        department = self.search_department_var.get()
+        section = self.search_section_var.get()
+        division = self.search_division_var.get()
+        description = self.search_description_var.get()
+        office_room = self.search_office_var.get()
+        mobile_raw = self.search_mobile_var.get()
+        telephone_raw = self.search_telephone_var.get()
+        manager_name = self.search_manager_var.get()
+        address = self.search_address_var.get()
+        need_mail = self.search_need_mail_var.get()
+
+        confirm = messagebox.askyesno(
+            "Подтверждение",
+            f"Обновить данные пользователя '{entry.get('displayName')}' "
+            f"в домене '{cfg['name']}'?",
+        )
+        if not confirm:
+            self.log("Обновление отменено пользователем.")
+            return
+
+        result_log, success = update_user_in_domain(
+            cfg,
+            sam,
+            title=title,
+            department=department,
+            office_room=office_room,
+            mobile_raw=mobile_raw,
+            telephone_raw=telephone_raw,
+            address=address,
+            manager_name=manager_name,
+            need_mail=need_mail,
+            description=description,
+            division=division,
+            section=section,
+        )
+        self.log(result_log)
+        if success:
+            entry.update(
+                {
+                    "title": title,
+                    "department": department,
+                    "section": section,
+                    "division": division,
+                    "description": description,
+                    "office": office_room,
+                    "mobile": mobile_raw,
+                    "telephoneNumber": telephone_raw,
+                    "managerName": manager_name,
+                    "streetAddress": address,
+                    "mail": sam + cfg["email_suffix"] if need_mail else "",
+                }
+            )
+            self.log(f"[{cfg['name']}] Изменения для пользователя '{entry.get('displayName')}' сохранены.")
+        else:
+            self.log(f"[{cfg['name']}] Не удалось сохранить изменения для пользователя '{entry.get('displayName')}'.")
 
     def _load_window_geometry(self):
         data = load_config()
@@ -1123,6 +1461,9 @@ class App(tk.Tk):
             address=address,
             manager_name=manager_name,
             need_mail=need_mail,
+            description=entry.get("description", ""),
+            division=entry.get("division", ""),
+            section=entry.get("section", ""),
         )
         self.log(result_log)
         if success:
@@ -1319,6 +1660,8 @@ class App(tk.Tk):
                 )
                 self.log(result_log)
                 if success and not dry_run:
+                    division_value = OMG_DIVISION_VALUE if cfg["name"] == "omg-cspfmba" else ""
+                    section_value = section_preview if cfg["name"] == "omg-cspfmba" else ""
                     history_entry = {
                         "display_name": display_name,
                         "sam": sam,
@@ -1331,6 +1674,9 @@ class App(tk.Tk):
                         "telephone_number": "",
                         "manager_name": manager_name,
                         "need_mail": parsed.get("need_mail") or False,
+                        "description": title_norm,
+                        "division": division_value,
+                        "section": section_value,
                     }
                     self.history_entries.append(history_entry)
                     self.history_listbox.insert(

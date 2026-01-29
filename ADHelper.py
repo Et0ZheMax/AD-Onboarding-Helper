@@ -192,30 +192,48 @@ def save_password_token(token: str) -> None:
     save_config(data)
 
 def run_powershell(command: str) -> subprocess.CompletedProcess:
+    encoding_setup = "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::UTF8; "
     full_cmd = [
         "powershell",
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
-        "-Command", command,
+        "-Command", encoding_setup + command,
     ]
-    return subprocess.run(full_cmd, capture_output=True, text=True, errors="replace")
+    return subprocess.run(
+        full_cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 def escape_ps_string(value: str) -> str:
     return (value or "").replace("'", "''")
 
-def parse_ps_json(raw: str) -> list:
+def escape_ldap_filter(value: str) -> str:
+    if not value:
+        return ""
+    res = value
+    res = res.replace("\\", "\\5c")
+    res = res.replace("*", "\\2a")
+    res = res.replace("(", "\\28")
+    res = res.replace(")", "\\29")
+    res = res.replace("\x00", "\\00")
+    return res
+
+def parse_ps_json(raw: str) -> tuple[list, str]:
     text = (raw or "").strip()
     if not text:
-        return []
+        return [], ""
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        return []
+        return [], "Не удалось разобрать ответ PowerShell (ожидался JSON)."
     if isinstance(data, list):
-        return data
+        return data, ""
     if isinstance(data, dict):
-        return [data]
-    return []
+        return [data], ""
+    return [], "Не удалось разобрать ответ PowerShell (неизвестный формат)."
 
 def translit_gost(text: str) -> str:
     mapping = {
@@ -492,31 +510,42 @@ def user_exists_by_display_name(cfg: dict, display_name: str) -> tuple[bool, str
         return False, ""
     return True, data
 
-def search_users_in_domain(cfg: dict, query: str) -> list:
+def search_users_in_domain(cfg: dict, query: str) -> tuple[list, str]:
     query = (query or "").strip()
     if not query:
-        return []
-    q_ps = escape_ps_string(query)
-    server = cfg["server"]
+        return [], ""
+    q_ldap = escape_ldap_filter(query)
+    server = escape_ps_string(cfg["server"])
     domain_name = cfg["name"]
+    q_digits = re.sub(r"\D", "", query)
+    q_digits_ldap = escape_ldap_filter(q_digits) if q_digits else ""
+    filter_parts = [
+        f"(displayName=*{q_ldap}*)",
+        f"(samAccountName=*{q_ldap}*)",
+    ]
+    if q_digits_ldap:
+        filter_parts.append(f"(telephoneNumber=*{q_digits_ldap}*)")
+        filter_parts.append(f"(mobile=*{q_digits_ldap}*)")
+    ldap_filter = "(|" + "".join(filter_parts) + ")"
+    ldap_filter_ps = escape_ps_string(ldap_filter)
     ps_lines = [
         "Import-Module ActiveDirectory",
-        f"$q = '{q_ps}'",
-        "$qDigits = ($q -replace '\\\\D', '')",
-        "$filter = \"DisplayName -like '*$q*' -or SamAccountName -like '*$q*'\"",
-        "if ($qDigits) { $filter += \" -or telephoneNumber -like '*$qDigits*' -or mobile -like '*$qDigits*'\" }",
-        f"$users = Get-ADUser -Server {server} -Filter $filter -ResultSetSize 100 "
-        "-Properties DisplayName,SamAccountName,telephoneNumber,mobile,title,department,"
+        f"$ldap = '{ldap_filter_ps}'",
+        f"$users = Get-ADUser -Server '{server}' -LDAPFilter $ldap -ResultSetSize 100 "
+        "-Properties DisplayName,SamAccountName,UserPrincipalName,telephoneNumber,mobile,title,department,"
         "physicalDeliveryOfficeName,manager,mail,streetAddress,postOfficeBox,l,st,postalCode,c,"
         "description,division,section",
         "$users | ForEach-Object {",
         "  $mgrName = ''",
-        f"  if ($_.Manager) {{ try {{ $mgrName = (Get-ADUser -Server {server} -Identity $_.Manager "
-        "-Properties DisplayName).DisplayName }} catch {{}} }}",
+        f"  if ($_.Manager) {{ $mgr = Get-ADUser -Server '{server}' -Identity $_.Manager "
+        "-Properties DisplayName -ErrorAction SilentlyContinue; "
+        "if ($mgr) { $mgrName = $mgr.DisplayName } }",
+        "  $display = if ($_.DisplayName) { $_.DisplayName } else { $_.Name }",
         "  [pscustomobject]@{",
         f"    domain = '{domain_name}'",
-        "    displayName = $_.DisplayName",
+        "    displayName = $display",
         "    sam = $_.SamAccountName",
+        "    upn = $_.UserPrincipalName",
         "    telephoneNumber = $_.telephoneNumber",
         "    mobile = $_.mobile",
         "    title = $_.title",
@@ -536,16 +565,25 @@ def search_users_in_domain(cfg: dict, query: str) -> list:
         "  }",
         "} | ConvertTo-Json -Depth 4",
     ]
-    proc = run_powershell("; ".join(ps_lines))
+    proc = run_powershell("\n".join(ps_lines))
     if proc.returncode != 0:
-        return []
-    return parse_ps_json(proc.stdout)
+        stderr = (proc.stderr or "").strip()
+        msg = stderr or "PowerShell вернул ошибку поиска."
+        return [], f"[{domain_name}] {msg}"
+    results, parse_error = parse_ps_json(proc.stdout)
+    if parse_error:
+        return [], f"[{domain_name}] {parse_error}"
+    return results, ""
 
-def search_users_in_all_domains(query: str) -> list:
+def search_users_in_all_domains(query: str) -> tuple[list, list]:
     results = []
+    errors = []
     for cfg in DOMAIN_CONFIGS:
-        results.extend(search_users_in_domain(cfg, query))
-    return results
+        domain_results, error = search_users_in_domain(cfg, query)
+        results.extend(domain_results)
+        if error:
+            errors.append(error)
+    return results, errors
 
 # ==========================
 # Создание пользователя
@@ -1276,7 +1314,7 @@ class App(tk.Tk):
             return
         modal.configure(cursor="watch")
         modal.update_idletasks()
-        results = search_users_in_all_domains(query)
+        results, errors = search_users_in_all_domains(query)
         modal.configure(cursor="")
         self.search_results = sorted(
             results,
@@ -1284,13 +1322,20 @@ class App(tk.Tk):
         )
         self.search_listbox.delete(0, "end")
         for item in self.search_results:
-            display_name = item.get("displayName") or "(без имени)"
+            display_name = (
+                item.get("displayName")
+                or item.get("sam")
+                or item.get("upn")
+                or "(без имени)"
+            )
             domain = item.get("domain") or "unknown"
             self.search_listbox.insert("end", f"{display_name} — {domain}")
         self.search_result_count_var.set(f"Найдено: {len(self.search_results)}")
         self.selected_search_index = None
         self.search_selected_label_var.set("Пользователь не выбран")
         self.btn_save_search.configure(state="disabled")
+        if errors:
+            messagebox.showwarning("Поиск", "Ошибки поиска:\n" + "\n".join(errors))
         if not self.search_results:
             messagebox.showinfo("Результаты", "Пользователи не найдены.")
 
@@ -1314,7 +1359,12 @@ class App(tk.Tk):
         self.search_manager_var.set(entry.get("managerName", "") or "")
         self.search_address_var.set(entry.get("streetAddress", "") or "")
         self.search_need_mail_var.set(bool(entry.get("mail")))
-        display_name = entry.get("displayName") or "(без имени)"
+        display_name = (
+            entry.get("displayName")
+            or entry.get("sam")
+            or entry.get("upn")
+            or "(без имени)"
+        )
         domain = entry.get("domain") or "unknown"
         self.search_selected_label_var.set(f"Редактирование: {display_name} ({domain})")
         self.btn_save_search.configure(state="normal")

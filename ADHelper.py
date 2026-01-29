@@ -7,7 +7,7 @@ import subprocess
 import re
 import tkinter as tk
 from tkinter import ttk, messagebox
-from typing import Optional
+from typing import Optional, Callable
 
 # ==========================
 # Конфигурация доменов
@@ -520,7 +520,11 @@ def user_exists_by_display_name(cfg: dict, display_name: str) -> tuple[bool, str
         return False, ""
     return True, data
 
-def search_users_in_domain(cfg: dict, query: str) -> tuple[list, str]:
+def search_users_in_domain(
+    cfg: dict,
+    query: str,
+    debug_log: Optional[Callable[[str], None]] = None,
+) -> tuple[list, str]:
     query = (query or "").strip()
     if not query:
         return [], ""
@@ -578,7 +582,25 @@ def search_users_in_domain(cfg: dict, query: str) -> tuple[list, str]:
         "  }",
         "} | ConvertTo-Json -Depth 4",
     ]
-    proc = run_powershell("\n".join(ps_lines))
+    ps_command = "\n".join(ps_lines)
+    proc = run_powershell(ps_command)
+    if debug_log and domain_name == "pak-cspmz":
+        stdout_preview = (proc.stdout or "").strip().replace("\r\n", "\n")
+        stderr_preview = (proc.stderr or "").strip().replace("\r\n", "\n")
+        if len(stdout_preview) > 500:
+            stdout_preview = stdout_preview[:500] + "...(truncated)"
+        if len(stderr_preview) > 500:
+            stderr_preview = stderr_preview[:500] + "...(truncated)"
+        debug_log("--- DEBUG: поиск пользователей в pak-cspmz ---")
+        debug_log(f"Запрос: {query}")
+        debug_log(f"Server: {cfg.get('server')}")
+        debug_log(f"SearchBase: {cfg.get('search_base') or '(не задан)'}")
+        debug_log(f"LDAP filter: {ldap_filter}")
+        debug_log(f"PowerShell rc: {proc.returncode}")
+        if stderr_preview:
+            debug_log(f"STDERR: {stderr_preview}")
+        debug_log(f"STDOUT preview: {stdout_preview or '(пусто)'}")
+        debug_log("--- конец DEBUG ---")
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
         msg = stderr or "PowerShell вернул ошибку поиска."
@@ -588,11 +610,14 @@ def search_users_in_domain(cfg: dict, query: str) -> tuple[list, str]:
         return [], f"[{domain_name}] {parse_error}"
     return results, ""
 
-def search_users_in_all_domains(query: str) -> tuple[list, list]:
+def search_users_in_all_domains(
+    query: str,
+    debug_log: Optional[Callable[[str], None]] = None,
+) -> tuple[list, list]:
     results = []
     errors = []
     for cfg in DOMAIN_CONFIGS:
-        domain_results, error = search_users_in_domain(cfg, query)
+        domain_results, error = search_users_in_domain(cfg, query, debug_log=debug_log)
         results.extend(domain_results)
         if error:
             errors.append(error)
@@ -1341,7 +1366,7 @@ class App(tk.Tk):
             return
         modal.configure(cursor="watch")
         modal.update_idletasks()
-        results, errors = search_users_in_all_domains(query)
+        results, errors = search_users_in_all_domains(query, debug_log=self.log)
         modal.configure(cursor="")
         self.search_results = sorted(
             results,

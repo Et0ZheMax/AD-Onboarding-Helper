@@ -541,6 +541,8 @@ def search_users_in_domain(
     if q_digits_ldap:
         filter_parts.append(f"(telephoneNumber=*{q_digits_ldap}*)")
         filter_parts.append(f"(mobile=*{q_digits_ldap}*)")
+        if domain_name == "omg-cspfmba":
+            filter_parts.append(f"(otpMobile=*{q_digits_ldap}*)")
     ldap_filter = "(|" + "".join(filter_parts) + ")"
     ldap_filter_ps = escape_ps_string(ldap_filter)
     search_base_arg = f" -SearchBase '{search_base}'" if search_base else ""
@@ -563,7 +565,7 @@ def search_users_in_domain(
         "c",
         "description",
     ]
-    extra_props = ["division", "section"] if domain_name == "omg-cspfmba" else []
+    extra_props = ["division", "section", "otpMobile"] if domain_name == "omg-cspfmba" else []
     props_arg = ",".join(base_props + extra_props)
     ps_lines = [
         "Import-Module ActiveDirectory",
@@ -584,6 +586,7 @@ def search_users_in_domain(
         "    upn = $_.UserPrincipalName",
         "    telephoneNumber = $_.telephoneNumber",
         "    mobile = $_.mobile",
+        "    otpMobile = $_.otpMobile",
         "    title = $_.title",
         "    department = $_.department",
         "    office = $_.physicalDeliveryOfficeName",
@@ -1284,6 +1287,7 @@ class App(tk.Tk):
         self.search_description_var = tk.StringVar()
         self.search_office_var = tk.StringVar()
         self.search_mobile_var = tk.StringVar()
+        self.search_otp_mobile_var = tk.StringVar()
         self.search_telephone_var = tk.StringVar()
         self.search_manager_var = tk.StringVar()
         self.search_address_var = tk.StringVar()
@@ -1347,26 +1351,29 @@ class App(tk.Tk):
         ttk.Label(frm_editor, text="Мобильный:").grid(row=7, column=0, sticky="e", padx=(0, 6))
         ttk.Entry(frm_editor, textvariable=self.search_mobile_var, width=60).grid(row=7, column=1, sticky="w")
 
-        ttk.Label(frm_editor, text="Стационарный:").grid(row=8, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_telephone_var, width=60).grid(row=8, column=1, sticky="w")
+        ttk.Label(frm_editor, text="OTP Mobile (omg):").grid(row=8, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_otp_mobile_var, width=60).grid(row=8, column=1, sticky="w")
 
-        ttk.Label(frm_editor, text="Руководитель:").grid(row=9, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_manager_var, width=60).grid(row=9, column=1, sticky="w")
+        ttk.Label(frm_editor, text="Стационарный:").grid(row=9, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_telephone_var, width=60).grid(row=9, column=1, sticky="w")
 
-        ttk.Label(frm_editor, text="Адрес офиса:").grid(row=10, column=0, sticky="e", padx=(0, 6))
+        ttk.Label(frm_editor, text="Руководитель:").grid(row=10, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_editor, textvariable=self.search_manager_var, width=60).grid(row=10, column=1, sticky="w")
+
+        ttk.Label(frm_editor, text="Адрес офиса:").grid(row=11, column=0, sticky="e", padx=(0, 6))
         ttk.Combobox(
             frm_editor,
             textvariable=self.search_address_var,
             values=ADDRESS_CHOICES,
             state="normal",
             width=57,
-        ).grid(row=10, column=1, sticky="w")
+        ).grid(row=11, column=1, sticky="w")
 
         ttk.Checkbutton(
             frm_editor,
             text="Назначить корпоративную почту",
             variable=self.search_need_mail_var,
-        ).grid(row=11, column=1, sticky="w", pady=(4, 4))
+        ).grid(row=12, column=1, sticky="w", pady=(4, 4))
 
         self.btn_save_search = ttk.Button(
             frm_editor,
@@ -1374,7 +1381,7 @@ class App(tk.Tk):
             command=self._save_search_changes,
             state="disabled",
         )
-        self.btn_save_search.grid(row=12, column=1, sticky="w", pady=(6, 0))
+        self.btn_save_search.grid(row=13, column=1, sticky="w", pady=(6, 0))
 
         entry.focus_set()
 
@@ -1426,6 +1433,7 @@ class App(tk.Tk):
         self.search_description_var.set(entry.get("description", "") or "")
         self.search_office_var.set(entry.get("office", "") or "")
         self.search_mobile_var.set(entry.get("mobile", "") or "")
+        self.search_otp_mobile_var.set(entry.get("otpMobile", "") or "")
         self.search_telephone_var.set(entry.get("telephoneNumber", "") or "")
         self.search_manager_var.set(entry.get("managerName", "") or "")
         self.search_address_var.set(entry.get("streetAddress", "") or "")
@@ -1458,7 +1466,10 @@ class App(tk.Tk):
         division = diff_field(self.search_division_var.get(), entry.get("division", ""))
         description = diff_field(self.search_description_var.get(), entry.get("description", ""))
         office_room = diff_field(self.search_office_var.get(), entry.get("office", ""))
-        mobile_raw = diff_field(self.search_mobile_var.get(), entry.get("mobile", ""))
+        if domain_name == "omg-cspfmba":
+            mobile_raw = diff_field(self.search_otp_mobile_var.get(), entry.get("otpMobile", ""))
+        else:
+            mobile_raw = diff_field(self.search_mobile_var.get(), entry.get("mobile", ""))
         telephone_raw = diff_field(
             self.search_telephone_var.get(),
             entry.get("telephoneNumber", ""),
@@ -1528,7 +1539,10 @@ class App(tk.Tk):
             if office_room is not None:
                 updates["office"] = office_room
             if mobile_raw is not None:
-                updates["mobile"] = mobile_raw
+                if domain_name == "omg-cspfmba":
+                    updates["otpMobile"] = mobile_raw
+                else:
+                    updates["mobile"] = mobile_raw
             if telephone_raw is not None:
                 updates["telephoneNumber"] = telephone_raw
             if manager_name is not None:

@@ -772,7 +772,7 @@ def create_user_in_domain(
     if is_omg and division:
         new_aduser_cmd += "-Division $division "
 
-    new_aduser_cmd += "-AccountPassword $securePassword -Enabled:$false "
+    new_aduser_cmd += "-AccountPassword $securePassword -Enabled:$true "
     new_aduser_cmd += "-ChangePasswordAtLogon $true "
 
     other_attrs_parts = []
@@ -786,6 +786,9 @@ def create_user_in_domain(
         new_aduser_cmd += " -OtherAttributes @{" + "; ".join(other_attrs_parts) + "}"
 
     ps_lines.append(new_aduser_cmd)
+    # Гарантируем смену пароля при первом входе даже если флаг ChangePasswordAtLogon
+    # не применился на этапе создания.
+    ps_lines.append(f"Set-ADUser -Server {cfg['server']} -Identity $sam -ChangePasswordAtLogon $true")
 
     # Post-обработка Manager — только в СВОЁМ домене, без fallback
     post_mgr_cmd = (
@@ -1164,8 +1167,12 @@ class App(tk.Tk):
 
         self.edit_title_var = tk.StringVar()
         self.edit_department_var = tk.StringVar()
+        self.edit_section_var = tk.StringVar()
+        self.edit_division_var = tk.StringVar()
+        self.edit_description_var = tk.StringVar()
         self.edit_office_var = tk.StringVar()
         self.edit_mobile_var = tk.StringVar()
+        self.edit_otp_mobile_var = tk.StringVar()
         self.edit_telephone_var = tk.StringVar()
         self.edit_manager_var = tk.StringVar()
         self.edit_need_mail_var = tk.BooleanVar()
@@ -1181,40 +1188,60 @@ class App(tk.Tk):
             row=2, column=1, sticky="w"
         )
 
-        ttk.Label(frm_history_editor, text="Кабинет:").grid(row=3, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_office_var, width=60).grid(
+        ttk.Label(frm_history_editor, text="Section:").grid(row=3, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_section_var, width=60).grid(
             row=3, column=1, sticky="w"
         )
 
-        ttk.Label(frm_history_editor, text="Мобильный:").grid(row=4, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_mobile_var, width=60).grid(
+        ttk.Label(frm_history_editor, text="Division:").grid(row=4, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_division_var, width=60).grid(
             row=4, column=1, sticky="w"
         )
 
-        ttk.Label(frm_history_editor, text="Стационарный:").grid(row=5, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_telephone_var, width=60).grid(
+        ttk.Label(frm_history_editor, text="Description:").grid(row=5, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_description_var, width=60).grid(
             row=5, column=1, sticky="w"
         )
 
-        ttk.Label(frm_history_editor, text="Руководитель:").grid(row=6, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_manager_var, width=60).grid(
+        ttk.Label(frm_history_editor, text="Кабинет:").grid(row=6, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_office_var, width=60).grid(
             row=6, column=1, sticky="w"
         )
 
-        ttk.Label(frm_history_editor, text="Адрес офиса:").grid(row=7, column=0, sticky="e", padx=(0, 6))
+        ttk.Label(frm_history_editor, text="Мобильный:").grid(row=7, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_mobile_var, width=60).grid(
+            row=7, column=1, sticky="w"
+        )
+
+        ttk.Label(frm_history_editor, text="OTP Mobile (omg):").grid(row=8, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_otp_mobile_var, width=60).grid(
+            row=8, column=1, sticky="w"
+        )
+
+        ttk.Label(frm_history_editor, text="Стационарный:").grid(row=9, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_telephone_var, width=60).grid(
+            row=9, column=1, sticky="w"
+        )
+
+        ttk.Label(frm_history_editor, text="Руководитель:").grid(row=10, column=0, sticky="e", padx=(0, 6))
+        ttk.Entry(frm_history_editor, textvariable=self.edit_manager_var, width=60).grid(
+            row=10, column=1, sticky="w"
+        )
+
+        ttk.Label(frm_history_editor, text="Адрес офиса:").grid(row=11, column=0, sticky="e", padx=(0, 6))
         ttk.Combobox(
             frm_history_editor,
             textvariable=self.edit_address_var,
             values=ADDRESS_CHOICES,
             state="normal",
             width=57,
-        ).grid(row=7, column=1, sticky="w")
+        ).grid(row=11, column=1, sticky="w")
 
         ttk.Checkbutton(
             frm_history_editor,
             text="Назначить корпоративную почту",
             variable=self.edit_need_mail_var,
-        ).grid(row=8, column=1, sticky="w", pady=(4, 4))
+        ).grid(row=12, column=1, sticky="w", pady=(4, 4))
 
         self.btn_save_changes = ttk.Button(
             frm_history_editor,
@@ -1222,7 +1249,7 @@ class App(tk.Tk):
             command=self._save_history_changes,
             state="disabled",
         )
-        self.btn_save_changes.grid(row=9, column=1, sticky="w", pady=(6, 0))
+        self.btn_save_changes.grid(row=13, column=1, sticky="w", pady=(6, 0))
 
     def log(self, msg: str):
         self.txt_log.configure(state="normal")
@@ -1585,8 +1612,12 @@ class App(tk.Tk):
         entry = self.history_entries[index]
         self.edit_title_var.set(entry.get("title", ""))
         self.edit_department_var.set(entry.get("department", ""))
+        self.edit_section_var.set(entry.get("section", ""))
+        self.edit_division_var.set(entry.get("division", ""))
+        self.edit_description_var.set(entry.get("description", ""))
         self.edit_office_var.set(entry.get("office_room", ""))
         self.edit_mobile_var.set(entry.get("mobile_phone", ""))
+        self.edit_otp_mobile_var.set(entry.get("otp_mobile", ""))
         self.edit_telephone_var.set(entry.get("telephone_number", ""))
         self.edit_manager_var.set(entry.get("manager_name", ""))
         self.edit_need_mail_var.set(bool(entry.get("need_mail")))
@@ -1603,8 +1634,14 @@ class App(tk.Tk):
 
         title = diff_field(self.edit_title_var.get(), entry.get("title", ""))
         department = diff_field(self.edit_department_var.get(), entry.get("department", ""))
+        section = diff_field(self.edit_section_var.get(), entry.get("section", ""))
+        division = diff_field(self.edit_division_var.get(), entry.get("division", ""))
+        description = diff_field(self.edit_description_var.get(), entry.get("description", ""))
         office_room = diff_field(self.edit_office_var.get(), entry.get("office_room", ""))
-        mobile_raw = diff_field(self.edit_mobile_var.get(), entry.get("mobile_phone", ""))
+        if cfg["name"] == "omg-cspfmba":
+            mobile_raw = diff_field(self.edit_otp_mobile_var.get(), entry.get("otp_mobile", ""))
+        else:
+            mobile_raw = diff_field(self.edit_mobile_var.get(), entry.get("mobile_phone", ""))
         telephone_raw = diff_field(
             self.edit_telephone_var.get(),
             entry.get("telephone_number", ""),
@@ -1620,6 +1657,9 @@ class App(tk.Tk):
             for value in (
                 title,
                 department,
+                section,
+                division,
+                description,
                 office_room,
                 mobile_raw,
                 telephone_raw,
@@ -1651,9 +1691,9 @@ class App(tk.Tk):
             address=address,
             manager_name=manager_name,
             need_mail=need_mail,
-            description=None,
-            division=None,
-            section=None,
+            description=description,
+            division=division,
+            section=section,
         )
         self.log(result_log)
         if success:
@@ -1662,10 +1702,19 @@ class App(tk.Tk):
                 updates["title"] = title
             if department is not None:
                 updates["department"] = department
+            if section is not None:
+                updates["section"] = section
+            if division is not None:
+                updates["division"] = division
+            if description is not None:
+                updates["description"] = description
             if office_room is not None:
                 updates["office_room"] = office_room
             if mobile_raw is not None:
-                updates["mobile_phone"] = mobile_raw
+                if cfg["name"] == "omg-cspfmba":
+                    updates["otp_mobile"] = mobile_raw
+                else:
+                    updates["mobile_phone"] = mobile_raw
             if telephone_raw is not None:
                 updates["telephone_number"] = telephone_raw
             if manager_name is not None:
@@ -1867,7 +1916,8 @@ class App(tk.Tk):
                         "title": title_norm,
                         "department": ad_department,
                         "office_room": parsed.get("office_room") or "",
-                        "mobile_phone": mobile_raw,
+                        "mobile_phone": mobile_raw if cfg["name"] != "omg-cspfmba" else "",
+                        "otp_mobile": mobile_raw if cfg["name"] == "omg-cspfmba" else "",
                         "telephone_number": "",
                         "manager_name": manager_name,
                         "need_mail": parsed.get("need_mail") or False,

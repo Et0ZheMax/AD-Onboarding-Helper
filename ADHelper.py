@@ -471,9 +471,22 @@ def get_omg_section(parsed: dict) -> str:
 
 def get_omg_ou_dn(cfg: dict, parsed: dict) -> str:
     department, section = get_omg_department_and_section(parsed)
+    return get_omg_ou_dn_from_values(cfg, department, section)
+
+
+def get_omg_ou_dn_from_values(cfg: dict, department: str, section: str) -> str:
     base_ou_dn = cfg["ou_dn"]
+    department = normalize_omg_unit_name(department)
+    section = normalize_omg_unit_name(section)
+
     if not department:
         return base_ou_dn
+
+    if department not in OMG_OU_TREE:
+        return base_ou_dn
+
+    if section and section not in OMG_OU_TREE.get(department, []):
+        section = ""
 
     branch = [f"OU={department}"]
     if section:
@@ -913,6 +926,7 @@ def update_user_in_domain(
     description: Optional[str],
     division: Optional[str],
     section: Optional[str],
+    target_ou_dn: Optional[str] = None,
 ) -> tuple[str, bool]:
     title_value = title.strip().lower() if title is not None else None
     department_value = department.strip().lower() if department is not None else None
@@ -1073,6 +1087,20 @@ def update_user_in_domain(
             "}"
         )
         ps_lines.append(post_mgr_cmd)
+
+    if target_ou_dn:
+        target_ou_dn_escaped = escape_ps_string(target_ou_dn)
+        ps_lines.extend([
+            f"$targetOU = '{target_ou_dn_escaped}'",
+            f"$user = Get-ADUser -Server {cfg['server']} -Identity $sam -Properties DistinguishedName",
+            "if ($user -and $user.DistinguishedName) {",
+            "  $currentDN = $user.DistinguishedName",
+            "  $currentParent = ($currentDN -split ',', 2)[1]",
+            "  if ($currentParent -ne $targetOU) {",
+            f"    Move-ADObject -Server {cfg['server']} -Identity $currentDN -TargetPath $targetOU",
+            "  }",
+            "}",
+        ])
 
     ps_script = "; ".join(ps_lines)
     proc = run_powershell(ps_script)
@@ -1592,6 +1620,12 @@ class App(tk.Tk):
         need_mail_before = bool(entry.get("mail"))
         need_mail = need_mail_current if need_mail_current != need_mail_before else None
 
+        target_ou_dn = None
+        if domain_name == "omg-cspfmba" and (department is not None or section is not None):
+            final_department = department if department is not None else (entry.get("department", "") or "")
+            final_section = section if section is not None else (entry.get("section", "") or "")
+            target_ou_dn = get_omg_ou_dn_from_values(cfg, final_department, final_section)
+
         if all(
             value is None
             for value in (
@@ -1634,6 +1668,7 @@ class App(tk.Tk):
             description=description,
             division=division,
             section=section,
+            target_ou_dn=target_ou_dn,
         )
         self.log(result_log)
         if success:
@@ -1750,6 +1785,12 @@ class App(tk.Tk):
         need_mail_before = bool(entry.get("need_mail"))
         need_mail = need_mail_current if need_mail_current != need_mail_before else None
 
+        target_ou_dn = None
+        if cfg["name"] == "omg-cspfmba" and (department is not None or section is not None):
+            final_department = department if department is not None else (entry.get("department", "") or "")
+            final_section = section if section is not None else (entry.get("section", "") or "")
+            target_ou_dn = get_omg_ou_dn_from_values(cfg, final_department, final_section)
+
         if all(
             value is None
             for value in (
@@ -1792,6 +1833,7 @@ class App(tk.Tk):
             description=description,
             division=division,
             section=section,
+            target_ou_dn=target_ou_dn,
         )
         self.log(result_log)
         if success:

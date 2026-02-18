@@ -72,17 +72,39 @@ ADDRESS_DETAILS = {
     },
 }
 
-# Логика section для omg
-OMG_SECTION_SKIP_DEPARTMENTS = {
-    "отдел научно-технического и методического обеспечения",
-    "отдел редакционно-издательской деятельности",
+# Структура OU для omg: Department -> Section
+OMG_OU_TREE = {
+    "outsource": [],
+    "отдел научно-технического и методического обеспечения": [],
+    "отдел редакционно-издательской деятельности": [],
+    "управление организации и проведения исследований": [
+        "лаборатория эпигенетических методов исследований",
+        "отдел анализа и прогнозирования медико-биологических рисков здоровью",
+        "отдел медицинской геномики",
+        "отдел организации проведения клинических исследований",
+    ],
+    "управление цифровых систем и биоинформатики": [
+        "отдел архивирования и хранения цифровой информации",
+        "отдел информационно-ресурсного обеспечения",
+        "отдел системной биологии и биоинформатики",
+    ],
+    "управление экспериментальной биотехнологии и генной инженерии": [
+        "виварий",
+        "лаборатория биобанкирования и мультиомиксных методов исследований",
+        "лаборатория генной инженерии",
+        "лаборатория гистологических исследований",
+        "лаборатория иммунологии и клеточной биологии",
+        "лаборатория метагеномных исследований",
+        "лаборатория микробиологии и паразитологии",
+        "лаборатория наноматериалов",
+        "лаборатория опасных и социально значимых инфекций",
+        "лаборатория разработки биотехнологических процессов",
+        "лаборатория синтеза олигонуклеотидов и малых молекул",
+    ],
 }
 
-OMG_MANAGEMENT_SECTION = {
-    "управление организации и проведения исследований",
-    "управление цифровых систем и биоинформатики",
-    "управление экспериментальной биотехнологии и генной инженерии",
-}
+OMG_DEPARTMENT_CHOICES = list(OMG_OU_TREE.keys())
+OMG_SECTION_CHOICES = sorted({section for sections in OMG_OU_TREE.values() for section in sections})
 
 OMG_DIVISION_VALUE = "институт синтетической биологии и генной инженерии"
 
@@ -381,6 +403,45 @@ def generate_samaccount_name(first_name: str, last_name: str) -> str:
         candidates.append(f"{base}{suffix}")
         suffix += 1
 
+
+def normalize_omg_unit_name(value: str) -> str:
+    text = (value or "").strip().lower().replace("ё", "е")
+    return re.sub(r"\s+", " ", text)
+
+
+def get_omg_department_and_section(parsed: dict) -> tuple[str, str]:
+    raw_dep = parsed.get("department") or ""
+    raw_mgmt = parsed.get("management") or ""
+
+    dep_parts = [normalize_omg_unit_name(part) for part in str(raw_dep).split("/") if part.strip()]
+    mgmt = normalize_omg_unit_name(str(raw_mgmt))
+
+    department = ""
+    section = ""
+
+    if dep_parts:
+        if dep_parts[0] in OMG_OU_TREE:
+            department = dep_parts[0]
+            if len(dep_parts) > 1:
+                section = dep_parts[-1]
+        elif dep_parts[-1] in OMG_OU_TREE:
+            department = dep_parts[-1]
+
+    if not department and mgmt in OMG_OU_TREE:
+        department = mgmt
+
+    if not department and dep_parts:
+        only_value = dep_parts[-1]
+        owners = [dep for dep, sections in OMG_OU_TREE.items() if only_value in sections]
+        if len(owners) == 1:
+            department = owners[0]
+            section = only_value
+
+    if section and section not in OMG_OU_TREE.get(department, []):
+        section = ""
+
+    return department, section
+
 def get_ad_department(parsed: dict) -> str:
     raw_dep = parsed.get("department")
     raw_mgmt = parsed.get("management")
@@ -403,27 +464,21 @@ def get_ad_department(parsed: dict) -> str:
     return dep[:64]
 
 def get_omg_section(parsed: dict) -> str:
-    """
-    section для omg, максимум 32 символа
-    """
-    raw_dep = (parsed.get("department") or "").strip().lower()
-    raw_mgmt = (parsed.get("management") or "").strip().lower()
+    """section для omg, максимум 32 символа"""
+    _, section = get_omg_department_and_section(parsed)
+    return section[:32]
 
-    if raw_dep and raw_dep in OMG_SECTION_SKIP_DEPARTMENTS:
-        return ""
 
-    if raw_mgmt and raw_mgmt in OMG_MANAGEMENT_SECTION:
-        if raw_dep:
-            parts = [p.strip() for p in raw_dep.split("/") if p.strip()]
-            if parts:
-                sec = parts[-1]
-            else:
-                sec = raw_dep
-        else:
-            sec = raw_mgmt
-        return sec[:32]
+def get_omg_ou_dn(cfg: dict, parsed: dict) -> str:
+    department, section = get_omg_department_and_section(parsed)
+    base_ou_dn = cfg["ou_dn"]
+    if not department:
+        return base_ou_dn
 
-    return ""
+    branch = [f"OU={department}"]
+    if section:
+        branch.insert(0, f"OU={section}")
+    return ",".join(branch + [base_ou_dn])
 
 def get_address_details(address: str) -> dict:
     base = {
@@ -665,7 +720,6 @@ def create_user_in_domain(
     title_raw = parsed.get("title") or ""
     title = title_raw.strip().lower()
 
-    department = get_ad_department(parsed)
     office_room = (parsed.get("office_room") or "").strip()
     need_mail = parsed.get("need_mail") or False
 
@@ -680,9 +734,13 @@ def create_user_in_domain(
     description = title
 
     is_omg = (cfg["name"] == "omg-cspfmba")
+    if is_omg:
+        department, section = get_omg_department_and_section(parsed)
+    else:
+        department = get_ad_department(parsed)
+        section = ""
     division = OMG_DIVISION_VALUE if is_omg else ""
     otp_mobile = mobile if is_omg and mobile else ""
-    section = get_omg_section(parsed) if is_omg else ""
 
     addr_meta = get_address_details(address)
     pobox = addr_meta["pobox"]
@@ -728,7 +786,7 @@ def create_user_in_domain(
     new_aduser_cmd = (
         "New-ADUser "
         f"-Server {cfg['server']} "
-        f"-Path '{cfg['ou_dn']}' "
+        f"-Path '{get_omg_ou_dn(cfg, parsed) if is_omg else cfg['ou_dn']}' "
         "-Name $name "
         "-GivenName $givenName "
         "-Surname $surname "
@@ -1184,14 +1242,25 @@ class App(tk.Tk):
         )
 
         ttk.Label(frm_history_editor, text="Отдел (Department):").grid(row=2, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_department_var, width=60).grid(
-            row=2, column=1, sticky="w"
+        self.cmb_edit_department = ttk.Combobox(
+            frm_history_editor,
+            textvariable=self.edit_department_var,
+            values=OMG_DEPARTMENT_CHOICES,
+            state="normal",
+            width=57,
         )
+        self.cmb_edit_department.grid(row=2, column=1, sticky="w")
+        self.cmb_edit_department.bind("<<ComboboxSelected>>", self._on_edit_department_changed)
 
         ttk.Label(frm_history_editor, text="Section:").grid(row=3, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_history_editor, textvariable=self.edit_section_var, width=60).grid(
-            row=3, column=1, sticky="w"
+        self.cmb_edit_section = ttk.Combobox(
+            frm_history_editor,
+            textvariable=self.edit_section_var,
+            values=OMG_SECTION_CHOICES,
+            state="normal",
+            width=57,
         )
+        self.cmb_edit_section.grid(row=3, column=1, sticky="w")
 
         ttk.Label(frm_history_editor, text="Division:").grid(row=4, column=0, sticky="e", padx=(0, 6))
         ttk.Entry(frm_history_editor, textvariable=self.edit_division_var, width=60).grid(
@@ -1361,10 +1430,25 @@ class App(tk.Tk):
         ttk.Entry(frm_editor, textvariable=self.search_title_var, width=60).grid(row=1, column=1, sticky="w")
 
         ttk.Label(frm_editor, text="Отдел (Department):").grid(row=2, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_department_var, width=60).grid(row=2, column=1, sticky="w")
+        self.cmb_search_department = ttk.Combobox(
+            frm_editor,
+            textvariable=self.search_department_var,
+            values=OMG_DEPARTMENT_CHOICES,
+            state="normal",
+            width=57,
+        )
+        self.cmb_search_department.grid(row=2, column=1, sticky="w")
+        self.cmb_search_department.bind("<<ComboboxSelected>>", self._on_search_department_changed)
 
         ttk.Label(frm_editor, text="Section:").grid(row=3, column=0, sticky="e", padx=(0, 6))
-        ttk.Entry(frm_editor, textvariable=self.search_section_var, width=60).grid(row=3, column=1, sticky="w")
+        self.cmb_search_section = ttk.Combobox(
+            frm_editor,
+            textvariable=self.search_section_var,
+            values=OMG_SECTION_CHOICES,
+            state="normal",
+            width=57,
+        )
+        self.cmb_search_section.grid(row=3, column=1, sticky="w")
 
         ttk.Label(frm_editor, text="Division:").grid(row=4, column=0, sticky="e", padx=(0, 6))
         ttk.Entry(frm_editor, textvariable=self.search_division_var, width=60).grid(row=4, column=1, sticky="w")
@@ -1455,6 +1539,7 @@ class App(tk.Tk):
         entry = self.search_results[index]
         self.search_title_var.set(entry.get("title", "") or "")
         self.search_department_var.set(entry.get("department", "") or "")
+        self._on_search_department_changed()
         self.search_section_var.set(entry.get("section", "") or "")
         self.search_division_var.set(entry.get("division", "") or "")
         self.search_description_var.set(entry.get("description", "") or "")
@@ -1584,6 +1669,18 @@ class App(tk.Tk):
         else:
             self.log(f"[{cfg['name']}] Не удалось сохранить изменения для пользователя '{entry.get('displayName')}'.")
 
+    def _get_sections_for_department(self, department: str) -> list[str]:
+        department_key = normalize_omg_unit_name(department)
+        return OMG_OU_TREE.get(department_key, OMG_SECTION_CHOICES)
+
+    def _on_edit_department_changed(self, _event=None):
+        sections = self._get_sections_for_department(self.edit_department_var.get())
+        self.cmb_edit_section.configure(values=sections)
+
+    def _on_search_department_changed(self, _event=None):
+        sections = self._get_sections_for_department(self.search_department_var.get())
+        self.cmb_search_section.configure(values=sections)
+
     def _load_window_geometry(self):
         data = load_config()
         geometry = data.get(CONFIG_GEOMETRY_KEY)
@@ -1612,6 +1709,7 @@ class App(tk.Tk):
         entry = self.history_entries[index]
         self.edit_title_var.set(entry.get("title", ""))
         self.edit_department_var.set(entry.get("department", ""))
+        self._on_edit_department_changed()
         self.edit_section_var.set(entry.get("section", ""))
         self.edit_division_var.set(entry.get("division", ""))
         self.edit_description_var.set(entry.get("description", ""))
@@ -1811,11 +1909,10 @@ class App(tk.Tk):
         title_raw = (parsed.get("title") or "").strip()
         title_norm = title_raw.lower()
         ad_department = get_ad_department(parsed)
+        omg_department, section_preview = get_omg_department_and_section(parsed)
 
         mobile_raw = parsed.get("mobile_phone") or ""
         mobile_norm = normalize_phone(mobile_raw) if mobile_raw else ""
-
-        section_preview = get_omg_section(parsed)
 
         self.log("--- Разобранные данные заявки ---")
         self.log(f"ФИО: {display_name}")
@@ -1843,8 +1940,10 @@ class App(tk.Tk):
             self.log(f"[{cfg['name']}] UPN: {upn_preview}, email: {email_preview or 'не задаётся'}")
             if cfg["name"] == "omg-cspfmba":
                 self.log(
-                    f"[{cfg['name']}] division: '{OMG_DIVISION_VALUE}', "
+                    f"[{cfg['name']}] department: '{omg_department}', "
+                    f"division: '{OMG_DIVISION_VALUE}', "
                     f"section: '{section_preview}', "
+                    f"target OU: '{get_omg_ou_dn(cfg, parsed)}', "
                     f"otpMobile: '{mobile_norm}' (MobilePhone не задаётся)"
                 )
         self.log("")
@@ -1908,13 +2007,14 @@ class App(tk.Tk):
                 if success and not dry_run:
                     division_value = OMG_DIVISION_VALUE if cfg["name"] == "omg-cspfmba" else ""
                     section_value = section_preview if cfg["name"] == "omg-cspfmba" else ""
+                    department_value = omg_department if cfg["name"] == "omg-cspfmba" else ad_department
                     history_entry = {
                         "display_name": display_name,
                         "sam": sam,
                         "cfg": cfg,
                         "address": address,
                         "title": title_norm,
-                        "department": ad_department,
+                        "department": department_value,
                         "office_room": parsed.get("office_room") or "",
                         "mobile_phone": mobile_raw if cfg["name"] != "omg-cspfmba" else "",
                         "otp_mobile": mobile_raw if cfg["name"] == "omg-cspfmba" else "",
@@ -1940,4 +2040,3 @@ class App(tk.Tk):
 if __name__ == "__main__":
     app = App()
     app.mainloop()
-

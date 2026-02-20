@@ -105,6 +105,11 @@ OMG_OU_TREE = {
 
 OMG_DEPARTMENT_CHOICES = list(OMG_OU_TREE.keys())
 OMG_SECTION_CHOICES = sorted({section for sections in OMG_OU_TREE.values() for section in sections})
+OMG_SECTION_TO_DEPARTMENT = {
+    section: department
+    for department, sections in OMG_OU_TREE.items()
+    for section in sections
+}
 
 OMG_DIVISION_VALUE = "институт синтетической биологии и генной инженерии"
 
@@ -1289,6 +1294,7 @@ class App(tk.Tk):
             width=57,
         )
         self.cmb_edit_section.grid(row=3, column=1, sticky="w")
+        self.cmb_edit_section.bind("<<ComboboxSelected>>", self._on_edit_section_changed)
 
         ttk.Label(frm_history_editor, text="Division:").grid(row=4, column=0, sticky="e", padx=(0, 6))
         ttk.Entry(frm_history_editor, textvariable=self.edit_division_var, width=60).grid(
@@ -1477,6 +1483,7 @@ class App(tk.Tk):
             width=57,
         )
         self.cmb_search_section.grid(row=3, column=1, sticky="w")
+        self.cmb_search_section.bind("<<ComboboxSelected>>", self._on_search_section_changed)
 
         ttk.Label(frm_editor, text="Division:").grid(row=4, column=0, sticky="e", padx=(0, 6))
         ttk.Entry(frm_editor, textvariable=self.search_division_var, width=60).grid(row=4, column=1, sticky="w")
@@ -1708,13 +1715,52 @@ class App(tk.Tk):
         department_key = normalize_omg_unit_name(department)
         return OMG_OU_TREE.get(department_key, OMG_SECTION_CHOICES)
 
+    def _get_department_for_section(self, section: str) -> str:
+        section_key = normalize_omg_unit_name(section)
+        return OMG_SECTION_TO_DEPARTMENT.get(section_key, "")
+
+    def _sync_department_and_section(
+        self,
+        department_var: tk.StringVar,
+        section_var: tk.StringVar,
+        section_combobox: ttk.Combobox,
+    ):
+        sections = self._get_sections_for_department(department_var.get())
+        section_combobox.configure(values=sections)
+
+        current_section = normalize_omg_unit_name(section_var.get())
+        if current_section and current_section not in sections:
+            section_var.set("")
+
+    def _sync_section_parent_department(self, department_var: tk.StringVar, section_var: tk.StringVar):
+        department = self._get_department_for_section(section_var.get())
+        if not department:
+            return
+        if normalize_omg_unit_name(department_var.get()) == department:
+            return
+        department_var.set(department)
+
     def _on_edit_department_changed(self, _event=None):
-        sections = self._get_sections_for_department(self.edit_department_var.get())
-        self.cmb_edit_section.configure(values=sections)
+        self._sync_department_and_section(
+            self.edit_department_var,
+            self.edit_section_var,
+            self.cmb_edit_section,
+        )
+
+    def _on_edit_section_changed(self, _event=None):
+        self._sync_section_parent_department(self.edit_department_var, self.edit_section_var)
+        self._on_edit_department_changed()
 
     def _on_search_department_changed(self, _event=None):
-        sections = self._get_sections_for_department(self.search_department_var.get())
-        self.cmb_search_section.configure(values=sections)
+        self._sync_department_and_section(
+            self.search_department_var,
+            self.search_section_var,
+            self.cmb_search_section,
+        )
+
+    def _on_search_section_changed(self, _event=None):
+        self._sync_section_parent_department(self.search_department_var, self.search_section_var)
+        self._on_search_department_changed()
 
     def _load_window_geometry(self):
         data = load_config()

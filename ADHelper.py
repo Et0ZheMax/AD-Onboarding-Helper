@@ -752,6 +752,8 @@ def create_user_in_domain(
     description = title
 
     is_omg = (cfg["name"] == "omg-cspfmba")
+    target_ou_dn = get_omg_ou_dn(cfg, parsed) if is_omg else cfg["ou_dn"]
+    fallback_ou_dn = cfg["ou_dn"]
     if is_omg:
         department, section = get_omg_department_and_section(parsed)
     else:
@@ -794,6 +796,9 @@ def create_user_in_domain(
         f"$state = '{state}'",
         f"$postalCode = '{postal_code}'",
         f"$country = '{country}'",
+        f"$targetPath = '{target_ou_dn}'",
+        f"$fallbackPath = '{fallback_ou_dn}'",
+        "$createdInFallbackOu = $false",
     ]
 
     if is_omg:
@@ -804,7 +809,7 @@ def create_user_in_domain(
     new_aduser_cmd = (
         "New-ADUser "
         f"-Server {cfg['server']} "
-        f"-Path '{get_omg_ou_dn(cfg, parsed) if is_omg else cfg['ou_dn']}' "
+        "-Path $targetPath "
         "-Name $name "
         "-GivenName $givenName "
         "-Surname $surname "
@@ -861,7 +866,25 @@ def create_user_in_domain(
     if other_attrs_parts:
         new_aduser_cmd += " -OtherAttributes @{" + "; ".join(other_attrs_parts) + "}"
 
-    ps_lines.append(new_aduser_cmd)
+    if is_omg and target_ou_dn != fallback_ou_dn:
+        new_aduser_cmd_fallback = new_aduser_cmd.replace("-Path $targetPath", "-Path $fallbackPath")
+        ps_lines.extend([
+            "try {",
+            f"  {new_aduser_cmd} -ErrorAction Stop",
+            "} catch {",
+            "  if ($_.Exception -and $_.Exception.Message -like '*Directory object not found*') {",
+            "    $createdInFallbackOu = $true",
+            f"    {new_aduser_cmd_fallback} -ErrorAction Stop",
+            "  } else {",
+            "    throw",
+            "  }",
+            "}",
+            "if ($createdInFallbackOu) {",
+            "  Write-Output '__OU_CONFLICT_FALLBACK__'",
+            "}",
+        ])
+    else:
+        ps_lines.append(new_aduser_cmd)
     # Гарантируем смену пароля при первом входе даже если флаг ChangePasswordAtLogon
     # не применился на этапе создания.
     ps_lines.append(f"Set-ADUser -Server {cfg['server']} -Identity $sam -ChangePasswordAtLogon $true")
@@ -905,6 +928,13 @@ def create_user_in_domain(
         log_lines.append(
             "Пояснение: не удалось установить руководителя (атрибут Manager) – "
             "объект руководителя не найден или недоступен в этом домене."
+        )
+
+    if "__OU_CONFLICT_FALLBACK__" in stdout:
+        log_lines.append(
+            "Пояснение: целевой OU по связке Управление/Отдел не найден. "
+            "Пользователь создан в базовом OU домена, но требуется ручная проверка "
+            "и перенос в правильный контейнер."
         )
 
     if stdout:

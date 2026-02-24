@@ -926,8 +926,11 @@ def create_user_in_domain(
     requested_target_ou_dn = (target_ou_dn or "").strip()
     target_ou_dn = requested_target_ou_dn or cfg["ou_dn"]
     fallback_ou_dn = cfg["ou_dn"]
+    target_ou_dn_ps = target_ou_dn.replace("'", "''")
+    fallback_ou_dn_ps = fallback_ou_dn.replace("'", "''")
     if is_omg:
-        department, section = get_omg_department_and_section(parsed)
+        department, _ = get_omg_department_and_section(parsed)
+        section = get_omg_section(parsed)
     else:
         department = get_ad_department(parsed)
         section = ""
@@ -972,8 +975,8 @@ def create_user_in_domain(
         f"$state = '{state}'",
         f"$postalCode = '{postal_code}'",
         f"$country = '{country}'",
-        f"$targetPath = '{target_ou_dn}'",
-        f"$fallbackPath = '{fallback_ou_dn}'",
+        f"$targetPath = '{target_ou_dn_ps}'",
+        f"$fallbackPath = '{fallback_ou_dn_ps}'",
         "$createdInFallbackOu = $false",
     ]
 

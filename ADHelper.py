@@ -899,6 +899,7 @@ def create_user_in_domain(
     address: str,
     manager_name: str = "",
     password_plain: str = "",
+    target_ou_dn: Optional[str] = None,
     dry_run: bool = False,
 ) -> tuple[str, bool]:
     last_name = parsed.get("last_name") or ""
@@ -922,7 +923,7 @@ def create_user_in_domain(
     description = title
 
     is_omg = (cfg["name"] == "omg-cspfmba")
-    target_ou_dn = get_omg_ou_dn(cfg, parsed) if is_omg else cfg["ou_dn"]
+    target_ou_dn = target_ou_dn or (get_omg_ou_dn(cfg, parsed) if is_omg else cfg["ou_dn"])
     fallback_ou_dn = cfg["ou_dn"]
     if is_omg:
         department, section = get_omg_department_and_section(parsed)
@@ -941,11 +942,15 @@ def create_user_in_domain(
 
     mgr_name_value = (manager_name or "").strip()
     mgr_name_escaped = mgr_name_value.replace("'", "''")
+    ad_server = escape_ps_string(get_preferred_dc(cfg))
+    retry_server = escape_ps_string(cfg.get("server") or get_preferred_dc(cfg))
 
     password_escaped = password_plain.replace("'", "''")
 
     ps_lines = [
         "Import-Module ActiveDirectory",
+        f"$srv = '{ad_server}'",
+        f"$retrySrv = '{retry_server}'",
         f"$securePassword = ConvertTo-SecureString '{password_escaped}' -AsPlainText -Force",
         f"$name = '{display_name}'",
         f"$givenName = '{first_name}'",
@@ -978,7 +983,7 @@ def create_user_in_domain(
 
     new_aduser_cmd = (
         "New-ADUser "
-        f"-Server {cfg['server']} "
+        "-Server $srv "
         "-Path $targetPath "
         "-Name $name "
         "-GivenName $givenName "
@@ -1057,7 +1062,7 @@ def create_user_in_domain(
         ps_lines.append(new_aduser_cmd)
     # Гарантируем смену пароля при первом входе даже если флаг ChangePasswordAtLogon
     # не применился на этапе создания.
-    ps_lines.append(f"Set-ADUser -Server {cfg['server']} -Identity $sam -ChangePasswordAtLogon $true")
+    ps_lines.append("Set-ADUser -Server $srv -Identity $sam -ChangePasswordAtLogon $true")
 
     # Post-обработка Manager — только в СВОЁМ домене, без fallback
     post_mgr_cmd = (
@@ -1084,7 +1089,10 @@ def create_user_in_domain(
     stdout = proc.stdout or ""
     success = proc.returncode == 0
 
-    log_lines = [f"[{cfg['name']}] New-ADUser/Set-ADUser выполнены, код {proc.returncode}"]
+    log_lines = [
+        f"[{cfg['name']}] New-ADUser/Set-ADUser выполнены, код {proc.returncode}",
+        f"[{cfg['name']}] Server для создания: $srv='{ad_server}' (retry='{retry_server}')",
+    ]
 
     # Человеческие расшифровки частых ошибок
     if "Server:8305" in stderr:
@@ -2335,16 +2343,45 @@ class App(tk.Tk):
         self.log("")
 
         self.log("--- Предпросмотр атрибутов для доменов ---")
+        create_target_ou: dict[str, str] = {}
         for cfg in selected_configs:
             upn_preview = sam + cfg["upn_suffix"]
             email_preview = sam + cfg["email_suffix"] if parsed.get("need_mail") else ""
             self.log(f"[{cfg['name']}] UPN: {upn_preview}, email: {email_preview or 'не задаётся'}")
             if cfg["name"] == "omg-cspfmba":
+                fallback_ou = cfg["ou_dn"]
+                dept_text = (parsed.get("department") or "").strip()
+                resolved_dn, candidates, confidence = resolve_target_ou(
+                    cfg,
+                    dept_text,
+                    base_path_hint=cfg.get("ou_dn"),
+                )
+                if resolved_dn and confidence == "high":
+                    target_ou_preview = resolved_dn
+                    self.log(
+                        f"[{cfg['name']}] OU resolver: auto-selected '{target_ou_preview}' "
+                        f"(dept='{dept_text}')"
+                    )
+                elif confidence == "low" and candidates:
+                    selected_ou = self._select_target_ou_with_dialog(cfg, dept_text)
+                    if selected_ou:
+                        target_ou_preview = selected_ou
+                    else:
+                        target_ou_preview = fallback_ou
+                        self.log(
+                            f"[{cfg['name']}] OU resolver: OU не выбран, создание будет в fallback OU '{fallback_ou}'."
+                        )
+                else:
+                    target_ou_preview = fallback_ou
+                    self.log(
+                        f"[{cfg['name']}] OU resolver: кандидаты не найдены, создание будет в fallback OU '{fallback_ou}'."
+                    )
+                create_target_ou[cfg["name"]] = target_ou_preview
                 self.log(
                     f"[{cfg['name']}] department: '{omg_department}', "
                     f"division: '{OMG_DIVISION_VALUE}', "
                     f"section: '{section_preview}', "
-                    f"target OU: '{get_omg_ou_dn(cfg, parsed)}', "
+                    f"target OU: '{target_ou_preview}', "
                     f"otpMobile: '{mobile_norm}' (MobilePhone не задаётся)"
                 )
         self.log("")
@@ -2402,6 +2439,7 @@ class App(tk.Tk):
                     address,
                     manager_name=manager_name,
                     password_plain=password_plain,
+                    target_ou_dn=create_target_ou.get(cfg["name"]),
                     dry_run=dry_run,
                 )
                 self.log(result_log)

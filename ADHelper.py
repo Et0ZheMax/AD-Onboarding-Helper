@@ -7,7 +7,7 @@ import subprocess
 import re
 import tkinter as tk
 from tkinter import ttk, messagebox
-from typing import Optional, Callable
+from typing import Optional, Callable, Any
 
 # ==========================
 # Конфигурация доменов
@@ -38,8 +38,14 @@ COMPANY_NAME = "ФГБУ «ЦСП» ФМБА России"
 
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "ADHelper")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+OU_MAP_PATH = os.path.join(CONFIG_DIR, "ou_map.json")
 CONFIG_PASSWORD_KEY = "password_token"
 CONFIG_GEOMETRY_KEY = "window_geometry"
+
+_POWERSHELL_EXE: Optional[str] = None
+_PREFERRED_DC_CACHE: dict[str, str] = {}
+
+_OU_CACHE: dict[str, list[dict[str, str]]] = {}
 
 ADDRESS_CHOICES = [
     "ул. Щукинская, дом 5, стр.5",
@@ -211,6 +217,33 @@ def save_config(data: dict) -> None:
     with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, indent=2)
 
+
+def normalize_text(value: str) -> str:
+    text = (value or "").strip().lower().replace("ё", "е")
+    text = text.replace("/", " ").replace("\\", " ")
+    text = text.replace('"', " ").replace("'", " ")
+    text = re.sub(r"\.+$", "", text)
+    return re.sub(r"\s+", " ", text)
+
+
+def load_ou_map() -> dict[str, str]:
+    if not os.path.exists(OU_MAP_PATH):
+        return {}
+    try:
+        with open(OU_MAP_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
+
+
+def save_ou_map(data: dict[str, str]) -> None:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(OU_MAP_PATH, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+
 def load_password_token() -> str:
     data = load_config()
     return data.get(CONFIG_PASSWORD_KEY, "") or ""
@@ -221,13 +254,36 @@ def save_password_token(token: str) -> None:
     data[CONFIG_PASSWORD_KEY] = token
     save_config(data)
 
-def run_powershell(command: str) -> subprocess.CompletedProcess:
+def find_powershell_exe() -> str:
+    global _POWERSHELL_EXE
+    if _POWERSHELL_EXE:
+        return _POWERSHELL_EXE
+    for candidate in ("powershell", "powershell.exe", "pwsh"):
+        try:
+            proc = subprocess.run(
+                [candidate, "-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError:
+            continue
+        if proc.returncode == 0:
+            _POWERSHELL_EXE = candidate
+            return candidate
+    _POWERSHELL_EXE = "powershell"
+    return _POWERSHELL_EXE
+
+
+def run_powershell(command: str, server: Optional[str] = None) -> subprocess.CompletedProcess:
     encoding_setup = "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::UTF8; "
+    server_setup = f"$PSDefaultParameterValues['*:Server']='{escape_ps_string(server)}'; " if server else ""
     full_cmd = [
-        "powershell",
+        find_powershell_exe(),
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
-        "-Command", encoding_setup + command,
+        "-Command", encoding_setup + server_setup + command,
     ]
     return subprocess.run(
         full_cmd,
@@ -236,6 +292,120 @@ def run_powershell(command: str) -> subprocess.CompletedProcess:
         encoding="utf-8",
         errors="replace",
     )
+
+
+def get_preferred_dc(domain_cfg: dict) -> str:
+    domain_name = domain_cfg["name"]
+    if domain_name in _PREFERRED_DC_CACHE:
+        return _PREFERRED_DC_CACHE[domain_name]
+    base_server = domain_cfg["server"]
+    ps = (
+        "Import-Module ActiveDirectory; "
+        f"(Get-ADDomain -Server '{escape_ps_string(base_server)}').PDCEmulator"
+    )
+    proc = run_powershell(ps)
+    pdc = (proc.stdout or "").strip()
+    if proc.returncode == 0 and pdc:
+        _PREFERRED_DC_CACHE[domain_name] = pdc
+    else:
+        _PREFERRED_DC_CACHE[domain_name] = base_server
+    return _PREFERRED_DC_CACHE[domain_name]
+
+
+def validate_ou_exists(domain_cfg: dict, ou_dn: str) -> bool:
+    if not ou_dn:
+        return False
+    server = get_preferred_dc(domain_cfg)
+    ou_escaped = escape_ps_string(ou_dn)
+    ps = (
+        "Import-Module ActiveDirectory; "
+        f"Get-ADOrganizationalUnit -Server '{escape_ps_string(server)}' -Identity '{ou_escaped}' "
+        "-ErrorAction Stop | Out-Null"
+    )
+    proc = run_powershell(ps, server=server)
+    return proc.returncode == 0
+
+
+def get_all_ous(domain_cfg: dict, search_base: Optional[str] = None) -> list[dict[str, str]]:
+    domain_name = domain_cfg["name"]
+    if domain_name in _OU_CACHE:
+        return _OU_CACHE[domain_name]
+    server = get_preferred_dc(domain_cfg)
+    sb = search_base or domain_cfg.get("search_base") or ""
+    sb_param = f" -SearchBase '{escape_ps_string(sb)}'" if sb else ""
+    ps = (
+        "Import-Module ActiveDirectory; "
+        "$result = Get-ADOrganizationalUnit "
+        f"-Server '{escape_ps_string(server)}' -Filter *{sb_param} "
+        "-Properties DistinguishedName,Name -ErrorAction SilentlyContinue | "
+        "Select-Object Name, DistinguishedName; "
+        "$result | ConvertTo-Json -Depth 4"
+    )
+    proc = run_powershell(ps, server=server)
+    if proc.returncode != 0:
+        _OU_CACHE[domain_name] = []
+        return []
+    data, _ = parse_ps_json(proc.stdout)
+    ous = []
+    for item in data:
+        name = (item.get("Name") or "").strip()
+        dn = (item.get("DistinguishedName") or "").strip()
+        if name and dn:
+            ous.append({"Name": name, "DistinguishedName": dn})
+    _OU_CACHE[domain_name] = ous
+    return ous
+
+
+def resolve_target_ou(domain_cfg: dict, dept_text: str, base_path_hint: Optional[str] = None) -> tuple[Optional[str], list[dict[str, Any]], str]:
+    dept_original = (dept_text or "").strip()
+    if not dept_original:
+        return None, [], "none"
+
+    ou_map = load_ou_map()
+    map_key = normalize_text(dept_original)
+    mapped_dn = ou_map.get(map_key) or ou_map.get(dept_original)
+    if mapped_dn and validate_ou_exists(domain_cfg, mapped_dn):
+        return mapped_dn, [{"Name": "mapped", "DistinguishedName": mapped_dn, "score": 999}], "high"
+
+    ous = get_all_ous(domain_cfg, search_base=base_path_hint)
+    dept_norm = normalize_text(dept_original)
+    candidates = []
+
+    path_parts = [normalize_text(p) for p in re.split(r"[\/]+", dept_original) if normalize_text(p)]
+    last_part = path_parts[-1] if path_parts else ""
+
+    for ou in ous:
+        ou_name = ou["Name"]
+        ou_dn = ou["DistinguishedName"]
+        ou_norm = normalize_text(ou_name)
+        score = 0
+
+        if last_part and ou_norm == last_part:
+            score = max(score, 4)
+
+        if ou_norm.startswith(dept_norm) or dept_norm.startswith(ou_norm):
+            score = max(score, 3)
+
+        tokens = [t for t in dept_norm.split() if len(t) >= 4]
+        token_score = sum(1 for token in tokens if token in ou_norm)
+        score = max(score, token_score)
+
+        if score > 0:
+            candidates.append({"Name": ou_name, "DistinguishedName": ou_dn, "score": score})
+
+    candidates.sort(key=lambda x: (-x["score"], x["Name"].lower()))
+    top_candidates = candidates[:5]
+
+    if not top_candidates:
+        return None, [], "low"
+
+    if len(top_candidates) == 1 and top_candidates[0]["score"] >= 3:
+        return top_candidates[0]["DistinguishedName"], top_candidates, "high"
+
+    if len(top_candidates) > 1 and top_candidates[0]["score"] >= 3 and top_candidates[0]["score"] >= top_candidates[1]["score"] + 2:
+        return top_candidates[0]["DistinguishedName"], top_candidates, "high"
+
+    return None, top_candidates, "low"
 
 def escape_ps_string(value: str) -> str:
     return (value or "").replace("'", "''")
@@ -892,11 +1062,11 @@ def create_user_in_domain(
     # Post-обработка Manager — только в СВОЁМ домене, без fallback
     post_mgr_cmd = (
         "if ($mgrName -ne '') { "
-        f"$mgr = Get-ADUser -Server {cfg['server']} "
+        "$mgr = Get-ADUser -Server $srv "
         "-Filter \"SamAccountName -eq '$mgrName' -or DisplayName -like '*$mgrName*'\" "
         "-ErrorAction SilentlyContinue | Select-Object -First 1; "
         "if ($mgr) { "
-        f"  Set-ADUser -Server {cfg['server']} -Identity $sam -Manager $mgr.DistinguishedName "
+        "  Set-ADUser -Server $srv -Identity $sam -Manager $mgr.DistinguishedName "
         "} "
         "}"
     )
@@ -988,10 +1158,14 @@ def update_user_in_domain(
 
     is_omg = (cfg["name"] == "omg-cspfmba")
     otp_mobile = mobile if is_omg and mobile else ""
+    ad_server = escape_ps_string(cfg["server"])
+    retry_server = escape_ps_string(get_preferred_dc(cfg))
 
     ps_lines = [
         "Import-Module ActiveDirectory",
         f"$sam = '{sam}'",
+        f"$srv = '{ad_server}'",
+        f"$retrySrv = '{retry_server}'",
     ]
 
     if title_value is not None:
@@ -1065,7 +1239,7 @@ def update_user_in_domain(
     if manager_value is not None and not manager_value:
         clear_parts.append("'manager'")
 
-    set_cmd = f"Set-ADUser -Server {cfg['server']} -Identity $sam "
+    set_cmd = "Set-ADUser -Server $srv -Identity $sam "
     if title_value:
         set_cmd += "-Title $title "
     if department_value:
@@ -1095,7 +1269,7 @@ def update_user_in_domain(
     if clear_parts:
         set_cmd += "-Clear @(" + ", ".join(clear_parts) + ") "
 
-    if set_cmd.strip() != f"Set-ADUser -Server {cfg['server']} -Identity $sam":
+    if set_cmd.strip() != "Set-ADUser -Server $srv -Identity $sam":
         ps_lines.append(set_cmd)
 
     replace_parts = []
@@ -1107,17 +1281,17 @@ def update_user_in_domain(
         replace_parts.append("'section'=$section")
 
     if replace_parts:
-        ps_lines.append("Set-ADUser -Server " + cfg["server"] + " -Identity $sam "
+        ps_lines.append("Set-ADUser -Server $srv -Identity $sam "
                         "-Replace @{" + "; ".join(replace_parts) + "}")
 
     if manager_value is not None:
         post_mgr_cmd = (
             "if ($mgrName -ne '') { "
-            f"$mgr = Get-ADUser -Server {cfg['server']} "
+            "$mgr = Get-ADUser -Server $srv "
             "-Filter \"SamAccountName -eq '$mgrName' -or DisplayName -like '*$mgrName*'\" "
             "-ErrorAction SilentlyContinue | Select-Object -First 1; "
             "if ($mgr) { "
-            f"  Set-ADUser -Server {cfg['server']} -Identity $sam -Manager $mgr.DistinguishedName "
+            "  Set-ADUser -Server $srv -Identity $sam -Manager $mgr.DistinguishedName "
             "} "
             "}"
         )
@@ -1125,17 +1299,30 @@ def update_user_in_domain(
 
     if target_ou_dn:
         target_ou_dn_escaped = escape_ps_string(target_ou_dn)
-        ps_lines.extend([
-            f"$targetOU = '{target_ou_dn_escaped}'",
-            f"$user = Get-ADUser -Server {cfg['server']} -Identity $sam -Properties DistinguishedName",
-            "if ($user -and $user.DistinguishedName) {",
-            "  $currentDN = $user.DistinguishedName",
-            "  $currentParent = ($currentDN -split ',', 2)[1]",
-            "  if ($currentParent -ne $targetOU) {",
-            f"    Move-ADObject -Server {cfg['server']} -Identity $currentDN -TargetPath $targetOU",
-            "  }",
-            "}",
-        ])
+        if validate_ou_exists(cfg, target_ou_dn):
+            ps_lines.extend([
+                f"$targetOU = '{target_ou_dn_escaped}'",
+                "$user = Get-ADUser -Server $srv -Identity $sam -Properties DistinguishedName,ObjectGUID -ErrorAction Stop",
+                "if ($user -and $user.DistinguishedName) {",
+                "  $currentDN = $user.DistinguishedName",
+                "  $currentParent = ($currentDN -split ',', 2)[1]",
+                "  if ($currentParent -ne $targetOU) {",
+                "    $guid = $user.ObjectGUID",
+                "    try {",
+                "      Move-ADObject -Server $srv -Identity $guid -TargetPath $targetOU -ErrorAction Stop",
+                "    } catch {",
+                "      $msg = $_.Exception.Message",
+                "      if (($msg -like '*ActiveDirectoryServer:8329*' -or $msg -like '*uninstantiated or deleted*') -and $retrySrv -ne $srv) {",
+                "        Move-ADObject -Server $retrySrv -Identity $guid -TargetPath $targetOU -ErrorAction Stop",
+                "      } else {",
+                "        throw",
+                "      }",
+                "    }",
+                "  }",
+                "}",
+            ])
+        else:
+            ps_lines.append("Write-Output '__MOVE_SKIPPED_INVALID_OU__'")
 
     ps_script = "; ".join(ps_lines)
     proc = run_powershell(ps_script)
@@ -1149,6 +1336,13 @@ def update_user_in_domain(
             "Пояснение: не удалось обновить руководителя – "
             "объект руководителя не найден или недоступен в этом домене."
         )
+    if "ActiveDirectoryServer:8329" in stderr or "uninstantiated or deleted" in stderr:
+        log_lines.append(
+            "Перемещение в OU не выполнено: на контроллере домена нет родительского контейнера "
+            "(репликация/OU). Попробуйте позже или используйте PDC."
+        )
+    if "__MOVE_SKIPPED_INVALID_OU__" in stdout:
+        log_lines.append("Move пропущен: целевой OU не существует на выбранном контроллере домена.")
     if stdout:
         log_lines.append("STDOUT:")
         log_lines.append(stdout)
@@ -1625,6 +1819,93 @@ class App(tk.Tk):
         self.search_selected_label_var.set(f"Редактирование: {display_name} ({domain})")
         self.btn_save_search.configure(state="normal")
 
+    def _select_target_ou_with_dialog(self, cfg: dict, dept_text: str) -> Optional[str]:
+        resolved_dn, candidates, confidence = resolve_target_ou(cfg, dept_text, base_path_hint=cfg.get("ou_dn"))
+        self.log(
+            f"[{cfg['name']}] OU resolve: dept='{dept_text}', confidence={confidence}, "
+            f"candidates={len(candidates)}"
+        )
+        if resolved_dn and confidence == "high":
+            self.log(f"[{cfg['name']}] OU auto-resolved: {resolved_dn}")
+            return resolved_dn
+
+        if not candidates:
+            self.log(f"[{cfg['name']}] Move пропущен: кандидаты OU не найдены для '{dept_text}'.")
+            return None
+
+        modal = tk.Toplevel(self)
+        modal.title("Выбор OU")
+        modal.geometry("900x420")
+        modal.transient(self)
+        modal.grab_set()
+
+        ttk.Label(modal, text=f"Отдел из заявки: {dept_text}").pack(anchor="w", padx=10, pady=(10, 4))
+        search_var = tk.StringVar()
+        remember_var = tk.BooleanVar(value=False)
+        selected_dn = tk.StringVar(value="")
+
+        frame = ttk.Frame(modal)
+        frame.pack(fill="both", expand=True, padx=10, pady=6)
+        ttk.Label(frame, text="Поиск:").pack(anchor="w")
+        entry = ttk.Entry(frame, textvariable=search_var)
+        entry.pack(fill="x", pady=(0, 6))
+
+        listbox = tk.Listbox(frame, height=12)
+        listbox.pack(fill="both", expand=True)
+
+        items = list(candidates)
+
+        def redraw(*_args):
+            query = normalize_text(search_var.get())
+            listbox.delete(0, "end")
+            for item in items:
+                text = f"{item['Name']} | {item['DistinguishedName']}"
+                if query and query not in normalize_text(text):
+                    continue
+                listbox.insert("end", text)
+
+        search_var.trace_add("write", redraw)
+        redraw()
+
+        def choose():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            visible = []
+            q = normalize_text(search_var.get())
+            for item in items:
+                text = f"{item['Name']} | {item['DistinguishedName']}"
+                if q and q not in normalize_text(text):
+                    continue
+                visible.append(item)
+            if idx >= len(visible):
+                return
+            selected_dn.set(visible[idx]["DistinguishedName"])
+            modal.destroy()
+
+        ttk.Checkbutton(modal, text="Запомнить соответствие для этого отдела", variable=remember_var).pack(
+            anchor="w", padx=10, pady=(0, 8)
+        )
+        btns = ttk.Frame(modal)
+        btns.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btns, text="Выбрать", command=choose).pack(side="left")
+        ttk.Button(btns, text="Отмена", command=modal.destroy).pack(side="left", padx=8)
+
+        modal.wait_window()
+        chosen = selected_dn.get().strip()
+        if not chosen:
+            self.log(f"[{cfg['name']}] Move пропущен: выбор OU отменен пользователем.")
+            return None
+
+        self.log(f"[{cfg['name']}] OU выбран вручную: {chosen}")
+        if remember_var.get():
+            ou_map = load_ou_map()
+            ou_map[normalize_text(dept_text)] = chosen
+            save_ou_map(ou_map)
+            self.log(f"[{cfg['name']}] Сопоставление отдела сохранено в ou_map.")
+        return chosen
+
     def _save_search_changes(self):
         if self.selected_search_index is None:
             messagebox.showerror("Ошибка", "Выберите пользователя из результатов поиска.")
@@ -1661,7 +1942,8 @@ class App(tk.Tk):
         if domain_name == "omg-cspfmba" and (department is not None or section is not None):
             final_department = department if department is not None else (entry.get("department", "") or "")
             final_section = section if section is not None else (entry.get("section", "") or "")
-            target_ou_dn = get_omg_ou_dn_from_values(cfg, final_department, final_section)
+            dept_text = " / ".join(x for x in [final_department, final_section] if x).strip() or final_department
+            target_ou_dn = self._select_target_ou_with_dialog(cfg, dept_text)
 
         if all(
             value is None
@@ -1865,7 +2147,8 @@ class App(tk.Tk):
         if cfg["name"] == "omg-cspfmba" and (department is not None or section is not None):
             final_department = department if department is not None else (entry.get("department", "") or "")
             final_section = section if section is not None else (entry.get("section", "") or "")
-            target_ou_dn = get_omg_ou_dn_from_values(cfg, final_department, final_section)
+            dept_text = " / ".join(x for x in [final_department, final_section] if x).strip() or final_department
+            target_ou_dn = self._select_target_ou_with_dialog(cfg, dept_text)
 
         if all(
             value is None

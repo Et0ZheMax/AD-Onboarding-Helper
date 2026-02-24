@@ -545,11 +545,11 @@ def parse_form(text: str) -> dict:
 def user_exists_in_domain(server: str, sam: str) -> bool:
     ps = (
         "Import-Module ActiveDirectory; "
-        f"$u = Get-ADUser -Server {server} "
+        "$u = Get-ADUser "
         f"-Filter \"SamAccountName -eq '{sam}'\" -ErrorAction SilentlyContinue; "
         "if ($u) { '1' } else { '0' };"
     )
-    proc = run_powershell(ps)
+    proc = run_powershell(ps, server=server)
     if proc.returncode != 0:
         return False
     output = (proc.stdout or "").strip()
@@ -697,13 +697,13 @@ def manager_exists_for_domain(cfg: dict, manager_name: str) -> bool:
     ps = (
         "Import-Module ActiveDirectory; "
         f"$name = '{name_ps}'; "
-        f"$mgr = Get-ADUser -Server {cfg['server']} "
+        "$mgr = Get-ADUser "
         "-Filter \"SamAccountName -eq '$name' -or DisplayName -like '*$name*'\" "
         "-ErrorAction SilentlyContinue | Select-Object -First 1; "
         "if ($mgr) { '1' } else { '0' }"
     )
 
-    proc = run_powershell(ps)
+    proc = run_powershell(ps, server=cfg["server"])
     if proc.returncode != 0:
         return False
     return (proc.stdout or "").strip() == "1"
@@ -719,7 +719,7 @@ def user_exists_in_domain_details(cfg: dict, sam: str, upn: str) -> tuple[bool, 
         "Import-Module ActiveDirectory; "
         f"$sam = '{sam_ps}'; "
         f"$upn = '{upn_ps}'; "
-        f"$user = Get-ADUser -Server {cfg['server']} "
+        "$user = Get-ADUser "
         "-Filter \"SamAccountName -eq '$sam' -or UserPrincipalName -eq '$upn'\" "
         "-Properties SamAccountName, UserPrincipalName, DisplayName "
         "-ErrorAction SilentlyContinue | Select-Object -First 1; "
@@ -728,7 +728,7 @@ def user_exists_in_domain_details(cfg: dict, sam: str, upn: str) -> tuple[bool, 
         "} "
     )
 
-    proc = run_powershell(ps)
+    proc = run_powershell(ps, server=cfg["server"])
     if proc.returncode != 0:
         return False, ""
     data = (proc.stdout or "").strip()
@@ -747,7 +747,7 @@ def user_exists_by_display_name(cfg: dict, display_name: str) -> tuple[bool, str
     ps = (
         "Import-Module ActiveDirectory; "
         f"$name = '{name_ps}'; "
-        f"$user = Get-ADUser -Server {cfg['server']} "
+        "$user = Get-ADUser "
         "-Filter \"DisplayName -eq '$name'\" "
         "-Properties SamAccountName, DisplayName "
         "-ErrorAction SilentlyContinue | Select-Object -First 1; "
@@ -755,7 +755,7 @@ def user_exists_by_display_name(cfg: dict, display_name: str) -> tuple[bool, str
         "  $user.SamAccountName + '|' + $user.DisplayName "
         "} "
     )
-    proc = run_powershell(ps)
+    proc = run_powershell(ps, server=cfg["server"])
     if proc.returncode != 0:
         return False, ""
     data = (proc.stdout or "").strip()
@@ -923,7 +923,8 @@ def create_user_in_domain(
     description = title
 
     is_omg = (cfg["name"] == "omg-cspfmba")
-    target_ou_dn = target_ou_dn or (get_omg_ou_dn(cfg, parsed) if is_omg else cfg["ou_dn"])
+    requested_target_ou_dn = (target_ou_dn or "").strip()
+    target_ou_dn = requested_target_ou_dn or cfg["ou_dn"]
     fallback_ou_dn = cfg["ou_dn"]
     if is_omg:
         department, section = get_omg_department_and_section(parsed)
@@ -1047,7 +1048,12 @@ def create_user_in_domain(
             "try {",
             f"  {new_aduser_cmd} -ErrorAction Stop",
             "} catch {",
-            "  if ($_.Exception -and $_.Exception.Message -like '*Directory object not found*') {",
+            "  $errType = $_.Exception.GetType().FullName",
+            "  $msg = (($_.Exception.Message) + ' ' + ($_.ToString()))",
+            "  $isOuNotFound = ($errType -like '*ADIdentityNotFoundException*') -or "
+            "($msg -like '*cannot find the object*') -or ($msg -like '*directory object not found*') -or "
+            "($msg -like '*не удается найти*') -or ($msg -like '*объект не найден*')",
+            "  if ($isOuNotFound) {",
             "    $createdInFallbackOu = $true",
             f"    {new_aduser_cmd_fallback} -ErrorAction Stop",
             "  } else {",
@@ -1093,6 +1099,10 @@ def create_user_in_domain(
         f"[{cfg['name']}] New-ADUser/Set-ADUser выполнены, код {proc.returncode}",
         f"[{cfg['name']}] Server для создания: $srv='{ad_server}' (retry='{retry_server}')",
     ]
+    if is_omg and not requested_target_ou_dn:
+        log_lines.append(
+            "Пояснение: целевой OU не определён resolver-ом, использован базовый контейнер домена (cfg['ou_dn'])."
+        )
 
     # Человеческие расшифровки частых ошибок
     if "Server:8305" in stderr:
@@ -1166,8 +1176,8 @@ def update_user_in_domain(
 
     is_omg = (cfg["name"] == "omg-cspfmba")
     otp_mobile = mobile if is_omg and mobile else ""
-    ad_server = escape_ps_string(cfg["server"])
-    retry_server = escape_ps_string(get_preferred_dc(cfg))
+    ad_server = escape_ps_string(get_preferred_dc(cfg))
+    retry_server = escape_ps_string(cfg["server"])
 
     ps_lines = [
         "Import-Module ActiveDirectory",
